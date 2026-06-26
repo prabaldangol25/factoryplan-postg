@@ -1,0 +1,17 @@
+.git
+.gitignore
+.dockerignore
+**/target
+**/node_modules
+frontend/dist
+frontend/.vercel
+**/*.db
+**/*.db-journal
+**/*.db-shm
+**/*.db-wal
+**/.env
+**/.env.local
+.vscode
+.idea
+.DS_Store
+Thumbs.db

@@ -1,0 +1,30 @@
+# Rust
+backend/target/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Python / generated analysis
+__pycache__/
+*.pyc
+backend/ids.json
+backend/resp.json
+backend/flexbay.py
+backend/flexbay2.py
+backend/flexbay_extra.json
+/-w
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Env / IDE
+.env
+.env.local
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

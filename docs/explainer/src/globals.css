@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-ink-950 text-slate-200 antialiased;
+  background-image:
+    radial-gradient(60rem 60rem at 80% -10%, rgba(99, 102, 241, 0.12), transparent),
+    radial-gradient(50rem 50rem at -10% 20%, rgba(34, 211, 238, 0.08), transparent);
+  background-attachment: fixed;
+  margin: 0;
+}
+
+/* Thin custom scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #0b1120; }
+::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #334155; }
+
+/* Reusable bits */
+.glass {
+  @apply rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur;
+}
+
+.chip {
+  @apply inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-medium;
+}
+
+.prose-accent a { @apply text-brand-300 underline decoration-brand-500/40 underline-offset-2; }
+
+/* code */
+.code-line { @apply block whitespace-pre; }
+.tok-key { @apply text-brand-300; }
+.tok-str { @apply text-accent-emerald; }
+.tok-fn { @apply text-accent-cyan; }
+.tok-com { @apply text-slate-500 italic; }
+.tok-num { @apply text-accent-amber; }

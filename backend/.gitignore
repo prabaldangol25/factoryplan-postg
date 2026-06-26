@@ -1,0 +1,13 @@
+/target
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+__pycache__/
+*.pyc
+ids.json
+resp.json
+flexbay.py
+flexbay2.py
+flexbay_extra.json
+.env
