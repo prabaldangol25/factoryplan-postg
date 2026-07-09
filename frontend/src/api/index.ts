@@ -3,6 +3,7 @@ import type {
   Scenario,
   Factory,
   Product,
+  ScenarioOrder,
   Demand,
   PeriodType,
   SpreadMode,
@@ -12,7 +13,7 @@ import type {
   AgentMessage,
 } from '../types'
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/$/, '')
 const apiUrl = (path: string) => `${apiBaseUrl}${path}`
 
 const client = axios.create({
@@ -81,15 +82,27 @@ export interface BayCountInput {
   bays: number
 }
 
+export interface BayWeekInput {
+  week_start: string
+  bays: number
+}
+
 export async function createFactory(
   scenarioId: string,
   name: string,
   bays: number,
   changeover_days: number,
   bay_counts: BayCountInput[] = [],
+  bay_weeks: BayWeekInput[] = [],
 ): Promise<Factory> {
   return client
-    .post(`/api/scenarios/${scenarioId}/factories`, { name, bays, changeover_days, bay_counts })
+    .post(`/api/scenarios/${scenarioId}/factories`, {
+      name,
+      bays,
+      changeover_days,
+      bay_counts,
+      bay_weeks,
+    })
     .then((r) => r.data)
     .catch(rethrow)
 }
@@ -100,15 +113,55 @@ export async function updateFactory(
   bays: number,
   changeover_days: number,
   bay_counts: BayCountInput[] = [],
+  bay_weeks: BayWeekInput[] = [],
 ): Promise<Factory> {
   return client
-    .put(`/api/factories/${id}`, { name, bays, changeover_days, bay_counts })
+    .put(`/api/factories/${id}`, { name, bays, changeover_days, bay_counts, bay_weeks })
     .then((r) => r.data)
     .catch(rethrow)
 }
 
 export async function deleteFactory(id: string): Promise<void> {
   return client.delete(`/api/factories/${id}`).then(() => undefined).catch(rethrow)
+}
+
+// ---------- orders ----------
+export interface OrderInput {
+  utid: string
+  build_type: string
+  customer: string
+  cycle_time_days: number
+  due_date?: string
+}
+
+export interface AnchorStatus {
+  utid: string
+  target_due_date: string
+  required_start: string
+  scheduled_finish: string
+  is_late: boolean
+}
+
+export async function listOrders(scenarioId: string): Promise<ScenarioOrder[]> {
+  return client.get(`/api/scenarios/${scenarioId}/orders`).then((r) => r.data).catch(rethrow)
+}
+
+export async function listAnchorStatuses(scenarioId: string): Promise<AnchorStatus[]> {
+  return client.get(`/api/scenarios/${scenarioId}/orders/anchor-statuses`).then((r) => r.data).catch(rethrow)
+}
+
+export async function replaceOrders(
+  scenarioId: string,
+  orders: OrderInput[],
+): Promise<ScenarioOrder[]> {
+  return client.put(`/api/scenarios/${scenarioId}/orders`, { orders }).then((r) => r.data).catch(rethrow)
+}
+
+export async function removeAnchor(
+  scenarioId: string,
+  utid: string,
+): Promise<ScenarioOrder[]> {
+  return client.delete(`/api/scenarios/${scenarioId}/orders/${utid}/anchor`).then((r) => r.data).catch(rethrow)
 }
 
 // ---------- products ----------
@@ -209,8 +262,11 @@ export type OptimizeMode = 'balance' | 'utilization'
 export async function runScenario(
   scenarioId: string,
   optimize: OptimizeMode = 'balance',
+  maxStartsPerWeek?: number | null,
 ): Promise<RunResult> {
-  const params = optimize === 'utilization' ? { optimize: 'utilization' } : {}
+  const params: Record<string, string | number> = {}
+  if (optimize === 'utilization') params.optimize = 'utilization'
+  if (maxStartsPerWeek != null && maxStartsPerWeek > 0) params.max_starts_per_week = maxStartsPerWeek
   return client
     .post(`/api/scenarios/${scenarioId}/run`, null, { params })
     .then((r) => r.data)

@@ -1,6 +1,7 @@
 use actix_web::{get, post, web, HttpResponse};
+use chrono::{Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::db::{new_id, now_iso, Pool};
 use crate::error::{AppError, AppResult};
@@ -8,8 +9,8 @@ use crate::models::*;
 use crate::recommendations::{compute_recommendations, RecommendationOut};
 use crate::scheduling::{
     generate_serials, run_schedule_mode, run_schedule_with_lt_mode, BayAssignment, BayCountInput,
-    DemandInput, FactoryAllocationInput, FactoryInput, FactoryLeadTimeInput, LeadTimeInput,
-    ProductInput, ScheduleInput, ScheduleOutput, UnitStatus,
+    BayWeekInput, DemandInput, FactoryAllocationInput, FactoryInput, FactoryLeadTimeInput,
+    LeadTimeInput, ProductInput, ScheduleInput, ScheduleOutput, UnitStatus,
 };
 
 /// Query params for a run. `optimize=utilization` packs work to maximize bay
@@ -18,6 +19,8 @@ use crate::scheduling::{
 struct RunQuery {
     #[serde(default)]
     optimize: Option<String>,
+    #[serde(default)]
+    max_starts_per_week: Option<i64>,
 }
 
 impl RunQuery {
@@ -91,6 +94,23 @@ pub(crate) async fn load_schedule_input(
         .bind(&f.id)
         .fetch_all(pool)
         .await?;
+        let bws = sqlx::query_as::<_, BayWeekRow>(
+            "SELECT id, factory_id, week_start, bays FROM factory_bay_week WHERE factory_id = $1",
+        )
+        .bind(&f.id)
+        .fetch_all(pool)
+        .await?;
+        let bay_counts_by_week = bws
+            .into_iter()
+            .filter_map(|b| {
+                NaiveDate::parse_from_str(&b.week_start, "%Y-%m-%d")
+                    .ok()
+                    .map(|week_start| BayWeekInput {
+                        week_start,
+                        bays: b.bays,
+                    })
+            })
+            .collect();
         factories.push(FactoryInput {
             id: f.id,
             name: f.name,
@@ -104,6 +124,7 @@ pub(crate) async fn load_schedule_input(
                     bays: b.bays,
                 })
                 .collect(),
+            bay_counts_by_week,
         });
     }
 
@@ -192,6 +213,258 @@ pub(crate) async fn load_schedule_input(
     })
 }
 
+#[derive(Debug, Clone)]
+struct AsapFactory {
+    id: String,
+    weekly_bays: BTreeMap<NaiveDate, i64>,
+}
+
+fn bay_count_on(f: &AsapFactory, date: NaiveDate) -> i64 {
+    if let Some((&week_start, &bays)) = f.weekly_bays.range(..=date).next_back() {
+        if date <= week_start + Duration::days(6) {
+            return bays.max(0);
+        }
+    }
+    0
+}
+
+fn min_bays_in_window(f: &AsapFactory, start: NaiveDate, end: NaiveDate) -> i64 {
+    let mut d = start;
+    let mut min_bays = bay_count_on(f, d);
+    while d < end {
+        d += Duration::days(1);
+        min_bays = min_bays.min(bay_count_on(f, d));
+    }
+    min_bays
+}
+
+fn window_available(
+    intervals: &[(NaiveDate, NaiveDate)],
+    start: NaiveDate,
+    end: NaiveDate,
+) -> bool {
+    intervals.iter().all(|(s, e)| *e < start || *s > end)
+}
+
+pub(crate) fn schedule_orders_linear_finish(
+    factories: &[FactoryWithBayCounts],
+    orders: &[ScenarioOrder],
+    max_starts_per_week: Option<i64>,
+) -> AppResult<Vec<ScheduledUnit>> {
+    if orders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut facs: Vec<AsapFactory> = Vec::new();
+    let mut horizon_start: Option<NaiveDate> = None;
+    let mut latest_week: Option<NaiveDate> = None;
+    for f in factories {
+        let mut weekly_bays = BTreeMap::new();
+        for w in &f.bay_weeks {
+            let d = NaiveDate::parse_from_str(&w.week_start, "%Y-%m-%d").map_err(|_| {
+                AppError::BadRequest(format!(
+                    "invalid week_start {} for factory {}",
+                    w.week_start, f.name
+                ))
+            })?;
+            horizon_start = Some(horizon_start.map_or(d, |cur| cur.min(d)));
+            latest_week = Some(latest_week.map_or(d, |cur| cur.max(d)));
+            weekly_bays.insert(d, w.bays.max(0));
+        }
+        facs.push(AsapFactory {
+            id: f.id.clone(),
+            weekly_bays,
+        });
+    }
+    let Some(start_date) = horizon_start else {
+        return Err(AppError::BadRequest(
+            "enter weekly bay capacity for at least one factory".into(),
+        ));
+    };
+    let horizon_finish = latest_week.unwrap_or(start_date) + Duration::days(6);
+    let overflow_end = horizon_finish
+        + Duration::days(orders.iter().map(|o| o.cycle_time_days.max(1)).sum::<i64>() + 365);
+    let capacity_weeks =
+        ((latest_week.unwrap_or(start_date) - start_date).num_days() / 7 + 1).max(1);
+    let starts_per_week = max_starts_per_week
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| ((orders.len() as i64 + capacity_weeks - 1) / capacity_weeks).max(1));
+    let mut reservations: HashMap<(String, i64), Vec<(NaiveDate, NaiveDate)>> = HashMap::new();
+    let mut launches_by_week: HashMap<i64, i64> = HashMap::new();
+    let mut out = Vec::with_capacity(orders.len());
+
+    for (idx, o) in orders.iter().enumerate() {
+        let duration = o.cycle_time_days.max(1);
+        let idx = idx as i64;
+
+        // Use due_date if present, otherwise calculate from start_date
+        let (target_start, target_finish) = if let Some(due_date_str) = &o.due_date {
+            let due_date = NaiveDate::parse_from_str(due_date_str, "%Y-%m-%d").map_err(|_| {
+                AppError::BadRequest(format!(
+                    "invalid due_date {} for order {}",
+                    due_date_str, o.utid
+                ))
+            })?;
+            let start = due_date - Duration::days(duration - 1);
+            // Ensure start is not before horizon start
+            let start = start.max(start_date);
+            (start, due_date)
+        } else {
+            let week_bucket = idx / starts_per_week;
+            let slot_in_week = idx % starts_per_week;
+            let day_in_week = (slot_in_week * 7) / starts_per_week;
+            let start = start_date + Duration::days(week_bucket * 7 + day_in_week);
+            let finish = start + Duration::days(duration - 1);
+            (start, finish)
+        };
+
+        let is_anchored = o.due_date.is_some();
+        let latest_start_with_capacity = horizon_finish - Duration::days(duration - 1);
+        let mut best: Option<(NaiveDate, NaiveDate, String, i64)> = None;
+        let mut s = target_start;
+        while s <= latest_start_with_capacity && best.is_none() {
+            if !is_anchored {
+                let week_idx = ((s - start_date).num_days()).div_euclid(7);
+                if launches_by_week.get(&week_idx).copied().unwrap_or(0) >= starts_per_week {
+                    s = start_date + Duration::days((week_idx + 1) * 7);
+                    continue;
+                }
+            }
+
+            let e = s + Duration::days(duration - 1);
+            for f in &facs {
+                let cap = min_bays_in_window(f, s, e);
+                for bay in 0..cap {
+                    let key = (f.id.clone(), bay);
+                    let intervals = reservations.entry(key.clone()).or_default();
+                    if window_available(intervals, s, e) {
+                        best = Some((s, e, f.id.clone(), bay));
+                        break;
+                    }
+                }
+                if best.is_some() {
+                    break;
+                }
+            }
+            s += Duration::days(1);
+        }
+
+        if let Some((s, e, fid, bay)) = best {
+            reservations
+                .entry((fid.clone(), bay))
+                .or_default()
+                .push((s, e));
+            if !is_anchored {
+                let week_idx = ((s - start_date).num_days()).div_euclid(7);
+                *launches_by_week.entry(week_idx).or_insert(0) += 1;
+            }
+            out.push(ScheduledUnit {
+                id: new_id(),
+                run_id: String::new(),
+                demand_id: o.id.clone(),
+                product_id: o.customer.clone(),
+                factory_id: Some(fid),
+                bay_index: Some(bay),
+                required_start: s.to_string(),
+                due_date: e.to_string(),
+                status: "shipped".to_string(),
+                serial: Some(o.utid.clone()),
+                orig_due_date: Some(target_finish.to_string()),
+                is_late: e > target_finish,
+                is_anchored,
+            });
+        } else {
+            out.push(ScheduledUnit {
+                id: new_id(),
+                run_id: String::new(),
+                demand_id: o.id.clone(),
+                product_id: o.customer.clone(),
+                factory_id: None,
+                bay_index: None,
+                required_start: start_date.to_string(),
+                due_date: overflow_end.to_string(),
+                status: "unshippable".to_string(),
+                serial: Some(o.utid.clone()),
+                orig_due_date: Some(target_finish.to_string()),
+                is_late: false,
+                is_anchored: o.due_date.is_some(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+async fn run_orders_scenario(
+    pool: &Pool,
+    scenario_id: &str,
+    orders: Vec<ScenarioOrder>,
+    max_starts_per_week: Option<i64>,
+) -> AppResult<RunResponse> {
+    let factory_rows = sqlx::query_as::<_, Factory>(
+        "SELECT id, scenario_id, name, bays, changeover_days FROM factory WHERE scenario_id = $1 ORDER BY name",
+    )
+    .bind(scenario_id)
+    .fetch_all(pool)
+    .await?;
+    let mut factories = Vec::with_capacity(factory_rows.len());
+    for f in factory_rows {
+        factories.push(crate::handlers::factories::factory_with_bays(pool, f).await?);
+    }
+    let mut units = schedule_orders_linear_finish(&factories, &orders, max_starts_per_week)?;
+    let run_id = new_id();
+    let run_at = now_iso();
+    let shipped = units.iter().filter(|u| u.status == "shipped").count() as i64;
+    let unshippable = units.iter().filter(|u| u.status == "unshippable").count() as i64;
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO schedule_run (id, scenario_id, run_at, total_demand, shipped_on_time, shipped_late, unshippable) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+        .bind(&run_id)
+        .bind(scenario_id)
+        .bind(&run_at)
+        .bind(orders.len() as i64)
+        .bind(shipped)
+        .bind(0_i64)
+        .bind(unshippable)
+        .execute(&mut *tx)
+        .await?;
+
+    for u in &mut units {
+        u.run_id = run_id.clone();
+        sqlx::query("INSERT INTO scheduled_unit (id, run_id, demand_id, product_id, factory_id, bay_index, required_start, due_date, status, serial, orig_due_date, is_late, is_anchored) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)")
+            .bind(&u.id)
+            .bind(&run_id)
+            .bind(&u.demand_id)
+            .bind(&u.product_id)
+            .bind(u.factory_id.as_deref())
+            .bind(u.bay_index)
+            .bind(&u.required_start)
+            .bind(&u.due_date)
+            .bind(&u.status)
+            .bind(&u.serial)
+            .bind(&u.orig_due_date)
+            .bind(u.is_late)
+            .bind(u.is_anchored)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+
+    Ok(RunResponse {
+        run: ScheduleRun {
+            id: run_id,
+            scenario_id: scenario_id.to_string(),
+            run_at,
+            total_demand: orders.len() as i64,
+            shipped_on_time: shipped,
+            shipped_late: 0,
+            unshippable,
+        },
+        units,
+        recommendation: RecommendationOut::default(),
+        quarter_misses: vec![],
+        alternatives: vec![],
+    })
+}
+
 #[post("/api/scenarios/{id}/run")]
 async fn run_scenario(
     pool: web::Data<Pool>,
@@ -208,6 +481,24 @@ async fn run_scenario(
         .await?;
     if exists.is_none() {
         return Err(AppError::NotFound(format!("scenario {scenario_id}")));
+    }
+
+    let orders = sqlx::query_as::<_, ScenarioOrder>(
+        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
+    )
+    .bind(&scenario_id)
+    .fetch_all(pool.get_ref())
+    .await?;
+    if !orders.is_empty() {
+        return Ok(HttpResponse::Ok().json(
+            run_orders_scenario(
+                pool.get_ref(),
+                &scenario_id,
+                orders,
+                query.max_starts_per_week,
+            )
+            .await?,
+        ));
     }
 
     let input = load_schedule_input(pool.get_ref(), &scenario_id).await?;
@@ -256,7 +547,7 @@ async fn run_scenario(
             UnitStatus::Late => ("shipped", true),
             UnitStatus::Unshippable => ("unshippable", false),
         };
-        sqlx::query("INSERT INTO scheduled_unit (id, run_id, demand_id, product_id, factory_id, bay_index, required_start, due_date, status, serial, orig_due_date, is_late) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)")
+        sqlx::query("INSERT INTO scheduled_unit (id, run_id, demand_id, product_id, factory_id, bay_index, required_start, due_date, status, serial, orig_due_date, is_late, is_anchored) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)")
             .bind(new_id())
             .bind(&run_id)
             .bind(&u.demand_id)
@@ -269,6 +560,7 @@ async fn run_scenario(
             .bind(serial_for.get(i).cloned().flatten())
             .bind(u.orig_due_date.to_string())
             .bind(is_late)
+            .bind(false)
             .execute(&mut *tx)
             .await?;
     }
@@ -482,6 +774,7 @@ fn output_units_to_api(
                 serial: serial_for.get(i).cloned().flatten(),
                 orig_due_date: Some(u.orig_due_date.to_string()),
                 is_late,
+                is_anchored: false,
             }
         })
         .collect()
@@ -489,7 +782,7 @@ fn output_units_to_api(
 
 async fn load_units(pool: &Pool, run_id: &str) -> AppResult<Vec<ScheduledUnit>> {
     let units = sqlx::query_as::<_, ScheduledUnit>(
-        "SELECT id, run_id, demand_id, product_id, factory_id, bay_index, required_start, due_date, status, serial, orig_due_date, is_late FROM scheduled_unit WHERE run_id = $1 ORDER BY due_date",
+        "SELECT id, run_id, demand_id, product_id, factory_id, bay_index, required_start, due_date, status, serial, orig_due_date, is_late, is_anchored FROM scheduled_unit WHERE run_id = $1 ORDER BY due_date",
     )
     .bind(run_id)
     .fetch_all(pool)
@@ -567,4 +860,138 @@ async fn persist_rec<T: serde::Serialize>(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn factory() -> FactoryWithBayCounts {
+        FactoryWithBayCounts {
+            id: "f1".into(),
+            scenario_id: "s1".into(),
+            name: "F1".into(),
+            bays: 0,
+            changeover_days: 0,
+            bay_counts: vec![],
+            bay_weeks: vec![
+                BayWeekRow {
+                    id: "w1".into(),
+                    factory_id: "f1".into(),
+                    week_start: "2026-08-02".into(),
+                    bays: 10,
+                },
+                BayWeekRow {
+                    id: "w2".into(),
+                    factory_id: "f1".into(),
+                    week_start: "2026-08-09".into(),
+                    bays: 10,
+                },
+                BayWeekRow {
+                    id: "w3".into(),
+                    factory_id: "f1".into(),
+                    week_start: "2026-08-16".into(),
+                    bays: 10,
+                },
+                BayWeekRow {
+                    id: "w4".into(),
+                    factory_id: "f1".into(),
+                    week_start: "2026-08-23".into(),
+                    bays: 10,
+                },
+            ],
+        }
+    }
+
+    fn order(i: usize) -> ScenarioOrder {
+        ScenarioOrder {
+            id: format!("o{i}"),
+            scenario_id: "s1".into(),
+            utid: format!("U{i}"),
+            build_type: "BT".into(),
+            customer: "C".into(),
+            cycle_time_days: 1,
+            sort_order: i as i64,
+            due_date: None,
+        }
+    }
+
+    #[test]
+    fn plan_orders_start_linearly_across_capacity_horizon() {
+        let orders = vec![order(1), order(2), order(3), order(4)];
+        let units = schedule_orders_linear_finish(&[factory()], &orders, None).unwrap();
+        let starts: Vec<_> = units.iter().map(|u| u.required_start.as_str()).collect();
+        let finishes: Vec<_> = units.iter().map(|u| u.due_date.as_str()).collect();
+        assert_eq!(
+            starts,
+            vec!["2026-08-02", "2026-08-09", "2026-08-16", "2026-08-23"]
+        );
+        assert_eq!(finishes, starts);
+    }
+
+    #[test]
+    fn plan_orders_respect_explicit_weekly_start_cap() {
+        let orders = vec![order(1), order(2), order(3), order(4)];
+        let units = schedule_orders_linear_finish(&[factory()], &orders, Some(2)).unwrap();
+        let starts: Vec<_> = units.iter().map(|u| u.required_start.as_str()).collect();
+        assert_eq!(
+            starts,
+            vec!["2026-08-02", "2026-08-05", "2026-08-09", "2026-08-12"]
+        );
+    }
+
+    #[test]
+    fn one_weekly_start_cap_places_one_launch_per_week() {
+        let orders: Vec<_> = (1..=4).map(order).collect();
+        let units = schedule_orders_linear_finish(&[factory()], &orders, Some(1)).unwrap();
+        let starts: Vec<_> = units.iter().map(|u| u.required_start.as_str()).collect();
+        assert_eq!(
+            starts,
+            vec!["2026-08-02", "2026-08-09", "2026-08-16", "2026-08-23"]
+        );
+    }
+
+    #[test]
+    fn one_weekly_start_cap_shortfalls_past_capacity_horizon() {
+        let orders: Vec<_> = (1..=6).map(order).collect();
+        let units = schedule_orders_linear_finish(&[factory()], &orders, Some(1)).unwrap();
+        let shipped_starts: Vec<_> = units
+            .iter()
+            .filter(|u| u.status == "shipped")
+            .map(|u| u.required_start.as_str())
+            .collect();
+        assert_eq!(
+            shipped_starts,
+            vec!["2026-08-02", "2026-08-09", "2026-08-16", "2026-08-23"]
+        );
+        assert_eq!(units.iter().filter(|u| u.status == "unshippable").count(), 2);
+    }
+
+    #[test]
+    fn plan_orders_change_when_weekly_start_cap_changes() {
+        let orders: Vec<_> = (1..=10).map(order).collect();
+        let auto = schedule_orders_linear_finish(&[factory()], &orders, None).unwrap();
+        let one = schedule_orders_linear_finish(&[factory()], &orders, Some(1)).unwrap();
+        let two = schedule_orders_linear_finish(&[factory()], &orders, Some(2)).unwrap();
+        let ten = schedule_orders_linear_finish(&[factory()], &orders, Some(10)).unwrap();
+        let starts = |units: Vec<ScheduledUnit>| {
+            units
+                .into_iter()
+                .filter(|u| u.status == "shipped")
+                .map(|u| u.required_start)
+                .collect::<Vec<_>>()
+        };
+        let auto_starts = starts(auto);
+        let one_starts = starts(one);
+        let two_starts = starts(two);
+        let ten_starts = starts(ten);
+        assert_ne!(auto_starts, one_starts);
+        assert_ne!(auto_starts, two_starts);
+        assert_ne!(auto_starts, ten_starts);
+        assert_ne!(one_starts, ten_starts);
+        assert_eq!(
+            ten_starts[..4],
+            ["2026-08-02", "2026-08-02", "2026-08-03", "2026-08-04"]
+        );
+    }
 }

@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { Copy, Check } from 'lucide-react'
 import PlotComponent from 'react-plotly.js'
 import type { Factory, Product, RunResult, ScheduledUnit } from '../types'
 
@@ -13,27 +14,30 @@ interface Props {
 const DAY = 86400000
 
 const QUARTER_PALETTE = ['#dc2626', '#16a34a', '#eab308', '#2563eb']
+const FACTORY_PALETTE = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#ea580c', '#0891b2']
 
 const IDLE_COLOR = '#cbd5e1' // gaps between products (true idle)
 const OPEN_COLOR = '#86efac' // open/unused bay time — highlighted green
+const LATE_ANCHOR_COLOR = '#dc2626'
 
-/** Blend a hex color toward white by `amt` (0..1) — used to shade late units. */
-function lighten(hex: string, amt: number): string {
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex)
-  if (!m) return hex
-  const n = parseInt(m[1], 16)
-  const r = (n >> 16) & 0xff
-  const g = (n >> 8) & 0xff
-  const b = n & 0xff
-  const mix = (c: number) => Math.round(c + (255 - c) * amt)
-  return `rgb(${mix(r)}, ${mix(g)}, ${mix(b)})`
+function isLateAnchored(u: ScheduledUnit): boolean {
+  return Boolean(u.is_anchored && (u.is_late || (u.orig_due_date && u.due_date > u.orig_due_date)))
 }
 
-/** Get the normal + late color for a shipping quarter number (1-4). */
-function quarterColor(quarter: number): { normal: string; late: string } {
-  const normal = QUARTER_PALETTE[(quarter - 1) % 4]
-  const late = lighten(normal, 0.5)
-  return { normal, late }
+function anchorHoverDetails(u: ScheduledUnit): string {
+  if (!u.is_anchored) return ''
+  const target = u.orig_due_date ?? u.due_date
+  const missed = isLateAnchored(u) ? '<br><b>MISSED DUE DATE</b>' : ''
+  return `<br>Anchored target due: ${target}<br>Scheduled finish: ${u.due_date}${missed}`
+}
+
+function quarterColor(quarter: number): string {
+  return QUARTER_PALETTE[(quarter - 1) % 4]
+}
+
+function factoryColor(factories: Factory[], factoryId: string | null): string {
+  const idx = factories.findIndex((f) => f.id === factoryId)
+  return FACTORY_PALETTE[(idx >= 0 ? idx : 0) % FACTORY_PALETTE.length]
 }
 
 /** Quarter key from a date string "YYYY-MM-DD", e.g. "2026-Q3". */
@@ -81,22 +85,6 @@ function quarterLabel(ms: number): string {
   return `Q${q} '${yy}`
 }
 
-/** Provisioned bays for a factory in a specific (year, quarter): a per-quarter
- *  override if present, else the baseline bay count. */
-function effectiveBays(f: Factory, year: number, quarter: number): number {
-  const override = f.bay_counts.find((bc) => bc.year === year && bc.quarter === quarter)
-  return override ? override.bays : f.bays
-}
-
-interface BayNeed {
-  factoryId: string
-  factoryName: string
-  label: string // "Q3 '26"
-  needed: number // peak simultaneous units = theoretical min bays to stay on time
-  provisioned: number
-  free: number
-}
-
 /**
  * Compact bar label: quarter + 2-digit year (from the due date) + first 2
  * letters of the product name. e.g. due 2026-08-15, "Widget" -> "Q3'26 Wi".
@@ -135,7 +123,8 @@ export function GanttView({ result, factories, products }: Props) {
   const [showIdle, setShowIdle] = useState(false)
   const [scenario, setScenario] = useState('current')
   const [chartMode, setChartMode] = useState<'merged' | 'split'>('merged')
-  const [wideCharts, setWideCharts] = useState(false)
+  const [wideCharts, setWideCharts] = useState(true)
+  const [copied, setCopied] = useState(false)
   const alternatives = result.alternatives ?? []
   const selectedAlt = alternatives.find((a) => a.kind === scenario)
   const activeUnits = selectedAlt?.units ?? result.units
@@ -145,6 +134,256 @@ export function GanttView({ result, factories, products }: Props) {
     products.forEach((p) => m.set(p.id, p.name))
     return m
   }, [products])
+
+  const factoryNames = useMemo(() => {
+    const m = new Map<string, string>()
+    factories.forEach((f) => m.set(f.id, f.name))
+    return m
+  }, [factories])
+
+  const utidChart = useMemo(() => {
+    const units = activeUnits
+      .filter((u) => u.status === 'shipped' && u.factory_id != null)
+      .slice()
+      .filter((u) => view === 'all' || u.factory_id === view)
+      .sort((a, b) => a.required_start.localeCompare(b.required_start) || (a.serial ?? '').localeCompare(b.serial ?? ''))
+    const labels = units.map((u) => {
+      const baseLabel = u.serial || 'Unknown'
+      return u.is_anchored ? `⚓ ${baseLabel}` : baseLabel
+    })
+    const xs: number[] = []
+    const ys: string[] = []
+    const bases: number[] = []
+    const text: string[] = []
+    const hover: string[] = []
+    const colors: string[] = []
+    for (let i = 0; i < units.length; i++) {
+      const u = units[i]
+      const s = parseMs(u.required_start)
+      const e = parseMs(u.due_date) + DAY
+      const label = labels[i]
+      const fn = factoryNames.get(u.factory_id ?? '') ?? u.factory_id ?? ''
+      xs.push(e - s)
+      ys.push(label)
+      bases.push(s)
+      text.push(label)
+      colors.push(isLateAnchored(u) ? LATE_ANCHOR_COLOR : factoryColor(factories, u.factory_id))
+      hover.push(`${label}<br>${fn} · Bay ${(u.bay_index ?? 0) + 1}<br>${u.required_start} → ${u.due_date} (${Math.round((e - s) / DAY)}d)${anchorHoverDetails(u)}`)
+    }
+    return {
+      data: [
+        {
+          type: 'bar',
+          orientation: 'h',
+          name: 'Plan',
+          x: xs,
+          y: ys,
+          base: bases,
+          text,
+          textposition: 'inside',
+          insidetextanchor: 'start',
+          textfont: { color: '#ffffff', size: 10 },
+          marker: { color: colors, line: { color: 'rgba(255,255,255,0.6)', width: 1 } },
+          hovertext: hover,
+          hoverinfo: 'text',
+          showlegend: false,
+        } as Plotly.Data,
+      ],
+      layout: {
+        autosize: true,
+        barmode: 'overlay',
+        bargap: 0.25,
+        dragmode: 'pan',
+        xaxis: { type: 'date', title: { text: 'Date' }, tickformat: '%b %d', showgrid: true },
+        yaxis: {
+          title: { text: 'UTID' },
+          type: 'category',
+          categoryorder: 'array',
+          categoryarray: labels,
+          autorange: 'reversed',
+          automargin: true,
+        },
+        margin: { l: 20, r: 20, t: 20, b: 50 },
+        height: Math.max(260, labels.length * 24 + 120),
+      } as Partial<Plotly.Layout>,
+      width: Math.max(1000, units.length * 18),
+    }
+  }, [activeUnits, factories, factoryNames, view])
+
+  const concurrentCountChart = useMemo(() => {
+    const units = activeUnits
+      .filter((u) => u.status === 'shipped' && u.factory_id != null)
+      .slice()
+      .filter((u) => view === 'all' || u.factory_id === view)
+      .sort((a, b) => a.required_start.localeCompare(b.required_start))
+    if (units.length === 0) return null
+
+    const factoryIds = [...new Set(units.map((u) => u.factory_id!))].sort()
+    if (factoryIds.length === 0) return null
+
+    const allEvents: Array<{ date: string; delta: number }> = []
+    for (const u of units) {
+      const s = u.required_start
+      const e = u.due_date
+      allEvents.push({ date: s, delta: 1 })
+      const nextDay = new Date(Date.parse(e) + DAY).toISOString().slice(0, 10)
+      allEvents.push({ date: nextDay, delta: -1 })
+    }
+    allEvents.sort((a, b) => a.date.localeCompare(b.date))
+
+    const allDatesSet = new Set<string>()
+    for (const ev of allEvents) {
+      allDatesSet.add(ev.date)
+    }
+
+    if (allDatesSet.size === 0) return null
+
+    const allDates = Array.from(allDatesSet).sort()
+    const minDate = allDates[0]
+    const rangeMaxDate = allDates[allDates.length - 1]
+
+    const dateList: string[] = []
+    let currentDate = new Date(minDate)
+    const endDate = new Date(rangeMaxDate)
+
+    while (currentDate <= endDate) {
+      const iso = currentDate.toISOString().slice(0, 10)
+      dateList.push(iso)
+      currentDate = new Date(Date.parse(iso) + DAY)
+    }
+
+    const factoryEvents = new Map<string, Array<{ date: string; delta: number }>>()
+    for (const fid of factoryIds) {
+      factoryEvents.set(fid, [])
+    }
+
+    for (const u of units) {
+      const fid = u.factory_id!
+      const s = u.required_start
+      const e = u.due_date
+      factoryEvents.get(fid)!.push({ date: s, delta: 1 })
+      const nextDay = new Date(Date.parse(e) + DAY).toISOString().slice(0, 10)
+      factoryEvents.get(fid)!.push({ date: nextDay, delta: -1 })
+    }
+
+    for (const events of factoryEvents.values()) {
+      events.sort((a, b) => a.date.localeCompare(b.date))
+    }
+
+    const countMaps = new Map<string, Map<string, number>>()
+    for (const [fid, events] of factoryEvents) {
+      const countMap = new Map<string, number>()
+      let cur = 0
+      for (const ev of events) {
+        cur += ev.delta
+        countMap.set(ev.date, cur)
+      }
+      countMaps.set(fid, countMap)
+    }
+
+    const traces: Plotly.Data[] = []
+    const factoryCounts: number[][] = []
+    for (const fid of factoryIds) {
+      const countMap = countMaps.get(fid)!
+      const counts: number[] = []
+      let cur = 0
+      for (const d of dateList) {
+        cur = countMap.get(d) ?? cur
+        counts.push(cur)
+      }
+      factoryCounts.push(counts)
+
+      traces.push({
+        type: 'bar',
+        name: factoryNames.get(fid) ?? fid,
+        x: dateList,
+        y: counts,
+        marker: { color: factoryColor(factories, fid), opacity: 0.3 },
+        hovertemplate: `${factoryNames.get(fid) ?? fid}<br>%{x}<br>Bays: %{y}<extra></extra>`,
+        hoverinfo: 'text',
+        showlegend: true,
+      } as Plotly.Data)
+    }
+
+    const totalCounts = dateList.map((_, i) => factoryCounts.reduce((sum, counts) => sum + counts[i], 0))
+    const maxCount = Math.max(...totalCounts, 0)
+    const maxIndex = totalCounts.indexOf(maxCount)
+    const maxDate = maxIndex >= 0 ? dateList[maxIndex] : null
+
+    const maxBreakdown: Array<{ factoryId: string; factoryName: string; count: number }> = []
+    if (maxDate) {
+      for (let i = 0; i < factoryIds.length; i++) {
+        const fid = factoryIds[i]
+        const count = factoryCounts[i][maxIndex]
+        maxBreakdown.push({
+          factoryId: fid,
+          factoryName: factoryNames.get(fid) ?? fid,
+          count,
+        })
+      }
+      maxBreakdown.sort((a, b) => b.count - a.count)
+    }
+
+    const xMs = dateList.map(parseMs)
+    const minX = Math.min(...xMs)
+    const maxX = Math.max(...xMs)
+
+    return {
+      maxCount,
+      maxDate,
+      maxBreakdown,
+      data: traces,
+      layout: {
+        autosize: true,
+        barmode: 'stack',
+        bargap: 0,
+        barnorm: null,
+        dragmode: 'pan',
+        xaxis: { type: 'date', title: { text: '' }, tickformat: '%b %d', showgrid: true, range: [minX, maxX] },
+        yaxis: { title: { text: 'Bays' }, rangemode: 'tozero' },
+        margin: { l: 60, r: 20, t: 10, b: 40 },
+        height: 120,
+        legend: { orientation: 'h', y: -0.2, x: 0.5, xanchor: 'center' },
+        shapes: maxCount > 0
+          ? [
+              {
+                type: 'line',
+                x0: minDate,
+                x1: rangeMaxDate,
+                y0: maxCount,
+                y1: maxCount,
+                line: {
+                  color: '#ef4444',
+                  width: 2,
+                  dash: 'dot',
+                },
+              } as Plotly.Shape,
+            ]
+          : [],
+        annotations: maxCount > 0
+          ? [
+              {
+                x: maxDate,
+                y: maxCount,
+                text: `${maxCount}`,
+                xanchor: 'right',
+                yanchor: 'bottom',
+                showarrow: false,
+                font: {
+                  color: '#ef4444',
+                  size: 12,
+                  family: 'Arial',
+                },
+                bgcolor: 'rgba(255, 255, 255, 0.8)',
+                bordercolor: '#ef4444',
+                borderwidth: 1,
+                borderpad: 2,
+              },
+            ]
+          : [],
+      } as Partial<Plotly.Layout>,
+    }
+  }, [activeUnits, factories, factoryNames, view])
 
   const { charts, stats } = useMemo(() => {
     const shipped = activeUnits.filter((u) => u.status === 'shipped' && u.factory_id != null)
@@ -185,7 +424,7 @@ export function GanttView({ result, factories, products }: Props) {
         for (const qk of sortedQKeys) {
           const qUnits = quarterGroups.get(qk)!
           const qNum = parseInt(qk.slice(-1), 10)
-          const { normal: normalColor, late: lateColor } = quarterColor(qNum)
+          const color = quarterColor(qNum)
           const xs: number[] = []
           const ys: string[] = []
           const bases: number[] = []
@@ -200,17 +439,17 @@ export function GanttView({ result, factories, products }: Props) {
             if (label == null) continue
             const nm = productNames.get(u.product_id) ?? u.product_id
             const utid = u.serial && u.serial.length > 0 ? u.serial : shortLabel(u.due_date, nm)
+            const labelText = u.is_anchored ? `⚓ ${utid}` : utid
             xs.push(e - s)
             ys.push(label)
             bases.push(s)
-            labels.push(utid)
-            colors.push(u.is_late ? lateColor : normalColor)
+            labels.push(labelText)
+            colors.push(isLateAnchored(u) ? LATE_ANCHOR_COLOR : color)
             const serialLine = u.serial ? `UTID ${u.serial}<br>` : ''
-            const lateLine = u.is_late ? ' <b>(rolled out / late)</b>' : ''
             hovers.push(
-              `${serialLine}<b>${nm}</b>${lateLine}<br>${f.name} · ${shipQuarterLabel(qk)} · Bay ${(u.bay_index ?? 0) + 1}<br>${u.required_start} → ${u.due_date} (${Math.round(
+              `${serialLine}<b>${nm}</b><br>${f.name} · ${shipQuarterLabel(qk)} · Bay ${(u.bay_index ?? 0) + 1}<br>${u.required_start} → ${u.due_date} (${Math.round(
                 (e - s) / DAY,
-              )}d)`,
+              )}d)${anchorHoverDetails(u)}`,
             )
           }
 
@@ -451,7 +690,7 @@ export function GanttView({ result, factories, products }: Props) {
 
       return {
         key: shownFactories.map((f) => f.id).join('-') || `chart-${chartIndex}`,
-        title: merged ? 'All factories' : shownFactories[0]?.name ?? 'Factory',
+        title: '',
         data: traces,
         layout,
         stats,
@@ -463,63 +702,35 @@ export function GanttView({ result, factories, products }: Props) {
     return { charts, stats: charts.flatMap((chart) => chart.stats) }
   }, [view, chartMode, showIdle, factories, productNames, activeUnits])
 
-  // Bays needed (theoretical floor = peak simultaneous demand) vs provisioned,
-  // per factory per quarter. Mode-independent: it's the minimum bays required to
-  // host that factory's units on their windows without overlap.
-  const bayNeeds = useMemo<BayNeed[]>(() => {
+  const shipmentsByQuarter = useMemo(() => {
     const shipped = activeUnits.filter((u) => u.status === 'shipped' && u.factory_id != null)
-    if (shipped.length === 0) return []
-
-    // Overall quarter span across all shipped units.
-    let spanStart = Infinity
-    let spanEnd = -Infinity
-    for (const u of shipped) {
-      spanStart = Math.min(spanStart, parseMs(u.required_start))
-      spanEnd = Math.max(spanEnd, parseMs(u.due_date) + DAY)
-    }
-    spanStart = quarterStartMs(spanStart)
-    spanEnd = nextQuarterStartMs(spanEnd - 1)
-
-    const rows: BayNeed[] = []
-    for (const f of factories) {
-      const fUnits = shipped
-        .filter((u) => u.factory_id === f.id)
-        .map((u) => ({ s: parseMs(u.required_start), e: parseMs(u.due_date) + DAY }))
-      for (let q = spanStart; q < spanEnd; q = nextQuarterStartMs(q)) {
-        const qStart = q
-        const qEnd = nextQuarterStartMs(q)
-        // Peak overlap within this quarter (windows clipped to the quarter).
-        const events: Array<[number, number]> = []
-        for (const w of fUnits) {
-          const s = Math.max(w.s, qStart)
-          const e = Math.min(w.e, qEnd)
-          if (e > s) {
-            events.push([s, 1])
-            events.push([e, -1])
-          }
-        }
-        if (events.length === 0) continue // factory idle this quarter — skip row
-        events.sort((a, b) => (a[0] === b[0] ? a[1] - b[1] : a[0] - b[0]))
-        let cur = 0
-        let peak = 0
-        for (const [, delta] of events) {
-          cur += delta
-          if (cur > peak) peak = cur
-        }
-        const d = new Date(qStart)
-        const provisioned = effectiveBays(f, d.getUTCFullYear(), Math.floor(d.getUTCMonth() / 3) + 1)
-        rows.push({
-          factoryId: f.id,
-          factoryName: f.name,
-          label: quarterLabel(qStart),
-          needed: peak,
-          provisioned,
-          free: provisioned - peak,
-        })
+    const quarterKeys = Array.from(new Set(shipped.map((u) => shipQuarterKey(u.due_date)))).sort()
+    const rows = factories.map((f) => {
+      const counts: Record<string, number> = {}
+      for (const q of quarterKeys) counts[q] = 0
+      for (const u of shipped) {
+        if (u.factory_id === f.id) counts[shipQuarterKey(u.due_date)] = (counts[shipQuarterKey(u.due_date)] ?? 0) + 1
       }
-    }
-    return rows
+      return { factoryId: f.id, factoryName: f.name, counts, total: Object.values(counts).reduce((s, n) => s + n, 0) }
+    })
+    const totals: Record<string, number> = {}
+    for (const q of quarterKeys) totals[q] = rows.reduce((s, r) => s + (r.counts[q] ?? 0), 0)
+    return { quarterKeys, rows, totals, grandTotal: Object.values(totals).reduce((s, n) => s + n, 0) }
   }, [factories, activeUnits])
+
+  async function copyShipmentsForExcel() {
+    const header = ['Factory', ...shipmentsByQuarter.quarterKeys.map(shipQuarterLabel), 'Total']
+    const rows = shipmentsByQuarter.rows.map((r) => [
+      r.factoryName,
+      ...shipmentsByQuarter.quarterKeys.map((q) => String(r.counts[q] ?? 0)),
+      String(r.total),
+    ])
+    const totalRow = ['Total', ...shipmentsByQuarter.quarterKeys.map((q) => String(shipmentsByQuarter.totals[q] ?? 0)), String(shipmentsByQuarter.grandTotal)]
+    const tsv = [header.join('\t'), ...rows.map((r) => r.join('\t')), totalRow.join('\t')].join('\n')
+    await navigator.clipboard.writeText(tsv)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
 
   if (factories.length === 0) {
     return (
@@ -548,6 +759,29 @@ export function GanttView({ result, factories, products }: Props) {
 
   return (
     <div className="space-y-3">
+      <div>
+        {concurrentCountChart && concurrentCountChart.maxCount > 0 ? (
+          <div className="rounded-xl border-2 border-red-200 bg-white p-5 shadow-sm">
+            <div className="flex items-baseline gap-3">
+              <div className="text-slate-600 text-sm font-medium">Max bays needed</div>
+              <div className="text-4xl font-black text-slate-900">{concurrentCountChart.maxCount}</div>
+              <div className="text-sm text-slate-500">on {concurrentCountChart.maxDate}</div>
+            </div>
+            <div className="flex flex-wrap gap-3 mt-3">
+              {concurrentCountChart.maxBreakdown.map((item) => (
+                <div key={item.factoryId} className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border border-slate-200 shadow-sm">
+                  <span
+                    className="w-3 h-3 rounded-full shadow-sm"
+                    style={{ background: factoryColor(factories, item.factoryId) }}
+                  />
+                  <span className="text-slate-700 text-sm font-medium">{item.factoryName}</span>
+                  <span className="text-slate-900 text-sm font-bold">{item.count}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </div>
       <div className="flex flex-wrap items-center gap-4 text-sm">
         <div className="flex items-center gap-2">
           <span className="text-slate-600">Scenario:</span>
@@ -587,7 +821,7 @@ export function GanttView({ result, factories, products }: Props) {
         </div>
         {multi && view === 'all' && (
           <div className="flex items-center gap-2">
-            <span className="text-slate-600">Gantt:</span>
+            
             <div className="inline-flex rounded-md border border-slate-300 overflow-hidden">
               <button
                 type="button"
@@ -622,12 +856,107 @@ export function GanttView({ result, factories, products }: Props) {
           Highlight idle / open
         </label>
         <span className="text-xs text-slate-500">
-          Colors are by shipping quarter across all factories, recycled yearly.{' '}
-          <span className="text-slate-400">Dimmed tint</span> = rolled-out (late). Gaps{' '}
-          <em>between</em> products are <strong>idle</strong>;{' '}
+          UTID timeline colors are by factory; factory/bay Gantt colors are by shipping quarter. Gaps <em>between</em> products are <strong>idle</strong>;{' '}
           <strong className="text-green-600">green</strong> = open: after a bay&apos;s last unit
           ships (and entirely empty bays). Time before the first unit is ignored.
         </span>
+      </div>
+
+      {shipmentsByQuarter.quarterKeys.length > 0 && (
+        <div className={`${wideCharts ? 'relative left-1/2 -translate-x-1/2 w-[calc(100vw-3rem)]' : 'w-full'} rounded-lg border border-slate-200 bg-white p-4`}>
+          <div className="flex items-center justify-between mb-1">
+            <h4 className="text-sm font-semibold text-slate-700">Shipments per quarter</h4>
+            <button
+              onClick={copyShipmentsForExcel}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700"
+            >
+              {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+              {copied ? 'Copied' : 'Copy for Excel'}
+            </button>
+          </div>
+          <p className="text-xs text-slate-500 mb-3">
+            Units scheduled to ship in each quarter, separated by assigned factory.
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-slate-500 border-b border-slate-200">
+                  <th className="py-1 pr-3 font-medium">Factory</th>
+                  {shipmentsByQuarter.quarterKeys.map((q) => (
+                    <th key={q} className="py-1 px-3 font-medium text-right whitespace-nowrap">
+                      {shipQuarterLabel(q)}
+                    </th>
+                  ))}
+                  <th className="py-1 pl-3 font-medium text-right">Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shipmentsByQuarter.rows.map((r) => (
+                  <tr key={r.factoryId} className="border-b border-slate-100">
+                    <td className="py-1.5 pr-3">
+                      <span
+                        className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle"
+                        style={{ background: factoryColor(factories, r.factoryId) }}
+                      />
+                      {r.factoryName}
+                    </td>
+                    {shipmentsByQuarter.quarterKeys.map((q) => (
+                      <td key={q} className="py-1.5 px-3 text-right">
+                        {r.counts[q] || 0}
+                      </td>
+                    ))}
+                    <td className="py-1.5 pl-3 text-right font-medium">{r.total}</td>
+                  </tr>
+                ))}
+                <tr className="font-semibold">
+                  <td className="py-1.5 pr-3">Total</td>
+                  {shipmentsByQuarter.quarterKeys.map((q) => (
+                    <td key={q} className="py-1.5 px-3 text-right">
+                      {shipmentsByQuarter.totals[q] || 0}
+                    </td>
+                  ))}
+                  <td className="py-1.5 pl-3 text-right">{shipmentsByQuarter.grandTotal}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {concurrentCountChart && (
+        <div className={`${wideCharts ? 'relative left-1/2 -translate-x-1/2 w-[calc(100vw-3rem)]' : 'w-full'} rounded-lg border border-slate-200 bg-white p-3`}>
+          <div className="flex items-center justify-between mb-1">
+            <h4 className="text-sm font-semibold text-slate-700">Bays per day</h4>
+            <span className="text-xs text-slate-500">X-axis = Date · Stacked by factory</span>
+          </div>
+          <div className={wideCharts ? 'w-full overflow-x-auto pb-2' : 'w-full'}>
+            <Plot
+              key={`concurrent-${wideCharts ? 'wide' : 'compact'}`}
+              data={concurrentCountChart.data}
+              layout={concurrentCountChart.layout}
+              config={{ displayModeBar: false, displaylogo: false, responsive: true }}
+              style={{ width: wideCharts ? `max(100%, ${concurrentCountChart.layout.width || 1000}px)` : '100%' }}
+              useResizeHandler
+            />
+          </div>
+        </div>
+      )}
+
+      <div className={`${wideCharts ? 'relative left-1/2 -translate-x-1/2 w-[calc(100vw-3rem)]' : 'w-full'} rounded-lg border border-slate-200 bg-white p-3`}>
+        <div className="flex items-center justify-between mb-2">
+          <h4 className="text-sm font-semibold text-slate-700">UTID timeline</h4>
+          <span className="text-xs text-slate-500">Y-axis = UTID, X-axis = date</span>
+        </div>
+        <div className={wideCharts ? 'w-full overflow-x-auto pb-2' : 'w-full'}>
+          <Plot
+            key={`utid-${wideCharts ? 'wide' : 'compact'}`}
+            data={utidChart.data}
+            layout={utidChart.layout}
+            config={{ displayModeBar: false, displaylogo: false, responsive: true }}
+            style={{ width: wideCharts ? `max(100%, ${utidChart.width}px)` : '100%' }}
+            useResizeHandler
+          />
+        </div>
       </div>
 
       <div className={`${wideCharts ? 'relative left-1/2 -translate-x-1/2 w-[calc(100vw-3rem)]' : 'w-full'} space-y-3`}>
@@ -654,110 +983,6 @@ export function GanttView({ result, factories, products }: Props) {
           </div>
         ))}
       </div>
-
-      {bayNeeds.length > 0 && (
-        <div className="rounded-lg border border-slate-200 bg-white p-4">
-          <h4 className="text-sm font-semibold text-slate-700 mb-1">Bays needed vs. provisioned</h4>
-          <p className="text-xs text-slate-500 mb-3">
-            <strong>Needed</strong> is the peak number of units in build at once that quarter — the
-            minimum bays required to keep everything on time (independent of the assignment mode).
-            <strong className="text-green-600"> Free</strong> bays are provisioned but not needed and
-            could be closed for that quarter.
-          </p>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-500 border-b border-slate-200">
-                <th className="py-1 pr-3 font-medium">Factory</th>
-                <th className="py-1 pr-3 font-medium">Quarter</th>
-                <th className="py-1 pr-3 font-medium text-right">Needed</th>
-                <th className="py-1 pr-3 font-medium text-right">Provisioned</th>
-                <th className="py-1 font-medium text-right">Free</th>
-              </tr>
-            </thead>
-            <tbody>
-              {bayNeeds.map((b) => (
-                <tr key={`${b.factoryId}-${b.label}`} className="border-b border-slate-100">
-                  <td className="py-1.5 pr-3">
-                    <span
-                      className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle"
-                      style={{ background: '#64748b' }}
-                    />
-                    {b.factoryName}
-                  </td>
-                  <td className="py-1.5 pr-3 whitespace-nowrap">{b.label}</td>
-                  <td className="py-1.5 pr-3 text-right font-medium">{b.needed}</td>
-                  <td className="py-1.5 pr-3 text-right text-slate-500">{b.provisioned}</td>
-                  <td
-                    className={`py-1.5 text-right font-medium ${
-                      b.free > 0 ? 'text-green-600' : b.free < 0 ? 'text-rose-600' : 'text-slate-400'
-                    }`}
-                  >
-                    {b.free > 0 ? `${b.free} free` : b.free < 0 ? `${-b.free} short` : '0'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {stats.length > 0 && (
-        <div className="rounded-lg border border-slate-200 bg-white p-4">
-          <h4 className="text-sm font-semibold text-slate-700 mb-1">Capacity utilization</h4>
-          <p className="text-xs text-slate-500 mb-3">
-            <strong>Idle</strong> bay-days are gaps <em>between</em> products — the only truly
-            unused capacity within a bay&apos;s run. Time before a bay&apos;s first product is
-            ignored; time after its last product ships (and entirely empty bays) is{' '}
-            <strong>bay open</strong>, not idle. Utilization = busy ÷ (busy + idle).
-          </p>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-500 border-b border-slate-200">
-                <th className="py-1 pr-3 font-medium">Factory</th>
-                <th className="py-1 pr-3 font-medium text-right">Bays</th>
-                <th className="py-1 pr-3 font-medium text-right">Busy bay-days</th>
-                <th className="py-1 pr-3 font-medium text-right">Idle bay-days</th>
-                <th className="py-1 pr-3 font-medium text-right">Bay open</th>
-                <th className="py-1 font-medium text-right">Utilization</th>
-              </tr>
-            </thead>
-            <tbody>
-              {stats.map((s) => (
-                <tr key={s.id} className="border-b border-slate-100">
-                  <td className="py-1.5 pr-3">
-                    <span
-                      className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle"
-                      style={{ background: '#64748b' }}
-                    />
-                    {s.name}
-                  </td>
-                  <td className="py-1.5 pr-3 text-right">{s.bays}</td>
-                  <td className="py-1.5 pr-3 text-right">{Math.round(s.busyDays)}</td>
-                  <td className="py-1.5 pr-3 text-right">{Math.round(s.idleDays)}</td>
-                  <td className="py-1.5 pr-3 text-right text-slate-400">
-                    {Math.round(s.openDays)}
-                  </td>
-                  <td className="py-1.5 text-right font-medium">
-                    {(s.utilization * 100).toFixed(0)}%
-                  </td>
-                </tr>
-              ))}
-              {overall && stats.length > 1 && (
-                <tr className="font-semibold">
-                  <td className="py-1.5 pr-3">{overall.name}</td>
-                  <td className="py-1.5 pr-3 text-right">{overall.bays}</td>
-                  <td className="py-1.5 pr-3 text-right">{Math.round(overall.busyDays)}</td>
-                  <td className="py-1.5 pr-3 text-right">{Math.round(overall.idleDays)}</td>
-                  <td className="py-1.5 pr-3 text-right text-slate-400">
-                    {Math.round(overall.openDays)}
-                  </td>
-                  <td className="py-1.5 text-right">{(overall.utilization * 100).toFixed(0)}%</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      )}
     </div>
   )
 }

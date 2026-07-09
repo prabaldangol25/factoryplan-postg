@@ -326,6 +326,7 @@ mod tests {
                 bays: 1,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -360,6 +361,7 @@ mod tests {
                 bays: 1,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),

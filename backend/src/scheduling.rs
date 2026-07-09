@@ -17,7 +17,7 @@
 //! - Bays across all factories are one global pool (load-balanced first-fit).
 
 use chrono::{Datelike, Duration, NaiveDate};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// How many quarters past the last demanded quarter a unit may roll forward
 /// before it is declared truly unshippable.
@@ -51,12 +51,21 @@ pub struct FactoryInput {
     /// Per-(year, quarter) overrides. When present, overrides `bays` for that
     /// specific quarter only.
     pub bay_counts_by_quarter: Vec<BayCountInput>,
+    /// Per-week overrides. When present for a week, overrides both base bays and
+    /// quarter overrides for days in that week.
+    pub bay_counts_by_week: Vec<BayWeekInput>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BayCountInput {
     pub year: i64,
     pub quarter: i64,
+    pub bays: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BayWeekInput {
+    pub week_start: NaiveDate,
     pub bays: i64,
 }
 
@@ -477,21 +486,24 @@ impl AllocationIndex {
     }
 }
 
-// ---------- Bay-count lookup (per (factory, quarter)) ----------
+// ---------- Bay-count lookup (per factory, with quarter/week overrides) ----------
 
-/// Effective bay count per (factory, quarter), backed by a baseline.
+/// Effective bay count per factory, backed by a baseline.
 #[derive(Debug, Clone)]
 pub struct BayCountIndex {
     /// factory_id -> baseline bays
     baseline: HashMap<String, i64>,
     /// factory_id -> (year, quarter) -> bays
     overrides: HashMap<String, HashMap<(i64, i64), i64>>,
+    /// factory_id -> week_start -> bays
+    week_overrides: HashMap<String, BTreeMap<NaiveDate, i64>>,
 }
 
 impl BayCountIndex {
     pub fn new(factories: &[FactoryInput]) -> Self {
         let mut baseline: HashMap<String, i64> = HashMap::new();
         let mut overrides: HashMap<String, HashMap<(i64, i64), i64>> = HashMap::new();
+        let mut week_overrides: HashMap<String, BTreeMap<NaiveDate, i64>> = HashMap::new();
         for f in factories {
             baseline.insert(f.id.clone(), f.bays.max(0));
             let mut o: HashMap<(i64, i64), i64> = HashMap::new();
@@ -503,10 +515,18 @@ impl BayCountIndex {
             if !o.is_empty() {
                 overrides.insert(f.id.clone(), o);
             }
+            let mut w: BTreeMap<NaiveDate, i64> = BTreeMap::new();
+            for bc in &f.bay_counts_by_week {
+                w.insert(bc.week_start, bc.bays.max(0));
+            }
+            if !w.is_empty() {
+                week_overrides.insert(f.id.clone(), w);
+            }
         }
         BayCountIndex {
             baseline,
             overrides,
+            week_overrides,
         }
     }
 
@@ -521,8 +541,21 @@ impl BayCountIndex {
         self.baseline.get(factory_id).copied().unwrap_or(0)
     }
 
+    /// Effective bay count for a specific date. A week override applies from its
+    /// start date through the following six days, then falls back to quarter/base.
+    pub fn effective_on(&self, factory_id: &str, date: NaiveDate) -> i64 {
+        if let Some(w) = self.week_overrides.get(factory_id) {
+            if let Some((&week_start, &v)) = w.range(..=date).next_back() {
+                if date <= week_start + Duration::days(6) {
+                    return v;
+                }
+            }
+        }
+        self.effective(factory_id, date.year() as i64, quarter_of(date))
+    }
+
     /// Maximum effective bay count across baseline and all defined overrides.
-    /// Used to size the bay pool so every quarter's needs can be represented.
+    /// Used to size the bay pool so every period's needs can be represented.
     pub fn max_for(&self, factory_id: &str) -> i64 {
         let base = self.baseline.get(factory_id).copied().unwrap_or(0);
         let omax = self
@@ -530,46 +563,41 @@ impl BayCountIndex {
             .get(factory_id)
             .and_then(|m| m.values().copied().max())
             .unwrap_or(0);
-        base.max(omax)
+        let wmax = self
+            .week_overrides
+            .get(factory_id)
+            .and_then(|m| m.values().copied().max())
+            .unwrap_or(0);
+        base.max(omax).max(wmax)
     }
 
-    /// Minimum effective bay count across every quarter touched by [start, end].
+    /// Minimum effective bay count across every day touched by [start, end].
     /// A bay slot with index `i` may be used only if `i < this value`.
     pub fn min_in_window(&self, factory_id: &str, start: NaiveDate, end: NaiveDate) -> i64 {
         debug_assert!(start <= end);
-        let mut quarters: Vec<(i64, i64)> = Vec::new();
         let mut d = start;
-        loop {
-            let key = (d.year() as i64, quarter_of(d));
-            if quarters.last() != Some(&key) {
-                quarters.push(key);
-            }
-            // Jump to the first day of the next month to walk forward cheaply
-            let nm_year = if d.month() == 12 {
-                d.year() + 1
-            } else {
-                d.year()
-            };
-            let nm_month = if d.month() == 12 { 1 } else { d.month() + 1 };
-            let next = match NaiveDate::from_ymd_opt(nm_year, nm_month, 1) {
-                Some(v) => v,
-                None => break,
-            };
-            if next > end {
-                // capture end's quarter if not yet added
-                let key_end = (end.year() as i64, quarter_of(end));
-                if quarters.last() != Some(&key_end) {
-                    quarters.push(key_end);
-                }
-                break;
-            }
-            d = next;
+        let mut min_bays = self.effective_on(factory_id, d);
+        while d < end {
+            d += Duration::days(1);
+            min_bays = min_bays.min(self.effective_on(factory_id, d));
         }
-        quarters
-            .into_iter()
-            .map(|(y, q)| self.effective(factory_id, y, q))
-            .min()
-            .unwrap_or(0)
+        min_bays
+    }
+
+    pub fn week_change_candidates(&self, from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
+        let mut out = Vec::new();
+        for weeks in self.week_overrides.values() {
+            for (&week_start, _) in weeks.range(..=to) {
+                if week_start >= from {
+                    out.push(week_start);
+                }
+                let week_end_next = week_start + Duration::days(7);
+                if week_end_next >= from && week_end_next <= to {
+                    out.push(week_end_next);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -642,7 +670,6 @@ impl Bay {
 #[derive(Debug, Clone)]
 pub struct PoolBay {
     pub factory_id: String,
-    pub factory_name: String,
     pub changeover_days: i64,
     pub bay_index: i64, // 0-based within factory
     pub bay: Bay,
@@ -656,10 +683,6 @@ pub struct BayPool {
 }
 
 impl BayPool {
-    pub fn from_factories(factories: &[FactoryInput]) -> Self {
-        Self::from_factories_with(factories, BayAssignment::default())
-    }
-
     pub fn from_factories_with(factories: &[FactoryInput], assignment: BayAssignment) -> Self {
         let bay_counts = BayCountIndex::new(factories);
         let mut bays = Vec::new();
@@ -671,7 +694,6 @@ impl BayPool {
             for i in 0..max_bays {
                 bays.push(PoolBay {
                     factory_id: f.id.clone(),
-                    factory_name: f.name.clone(),
                     changeover_days: f.changeover_days.max(0),
                     bay_index: i,
                     bay: Bay::default(),
@@ -711,24 +733,8 @@ impl BayPool {
         (factory_load, bay_key, idx)
     }
 
-    pub fn bay_counts(&self) -> &BayCountIndex {
-        &self.bay_counts
-    }
-
-    /// Find the **least-loaded** bay free in [start, end]. Returns index into
-    /// `bays`. This spreads demand across factories and across bays within a
-    /// factory, rather than always piling on the first bay.
-    ///
-    /// Slots are also filtered to those that exist for the entire window —
-    /// i.e. `bay_index < bay_counts.min_in_window(factory, start, end)`. This
-    /// is what lets the bay count vary by quarter.
-    ///
-    /// Ranking is:
-    ///   1. lowest per-factory total reserved days  (split across factories)
-    ///   2. lowest per-bay reserved days            (split within a factory)
-    ///   3. lowest pool index                       (deterministic tiebreak)
-    pub fn find_free(&self, start: NaiveDate, end: NaiveDate) -> Option<usize> {
-        self.find_free_where(start, end, |_| true)
+    pub fn bay_count_change_candidates(&self, from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
+        self.bay_counts.week_change_candidates(from, to)
     }
 
     pub fn find_free_where<A>(&self, start: NaiveDate, end: NaiveDate, allowed: A) -> Option<usize>
@@ -772,20 +778,6 @@ impl BayPool {
             }
         }
         best.map(|(_, _, i)| i)
-    }
-
-    /// Like `find_free`, but the occupied window may differ per factory.
-    /// `window(factory_id)` returns the `(start, finish)` the unit would occupy
-    /// if built at that factory — this is what makes per-factory lead times work
-    /// while preserving load-balanced placement. A bay is eligible only if its
-    /// per-window effective bay-count gate passes and the interval is free.
-    /// Ranking matches `find_free` (least-loaded factory, then least-loaded bay,
-    /// then pool index). Returns `(start, finish, pool_index)` of the chosen bay.
-    pub fn find_free_window<W>(&self, window: W) -> Option<(NaiveDate, NaiveDate, usize)>
-    where
-        W: Fn(&str) -> (NaiveDate, NaiveDate),
-    {
-        self.find_free_window_where(window, |_| true)
     }
 
     pub fn find_free_window_where<W, A>(
@@ -1076,9 +1068,12 @@ fn place_asap(
     horizon_end: Option<NaiveDate>,
 ) -> Option<(NaiveDate, NaiveDate, usize)> {
     // Availability only changes at: release, the day after each existing
-    // reservation ends, and each quarter boundary (variable bay counts).
+    // reservation ends, quarter boundaries, and weekly capacity changes.
     let mut cands = vec![u.release];
     cands.extend(pool.reservation_end_candidates(u.release));
+    if let Some(hend) = horizon_end {
+        cands.extend(pool.bay_count_change_candidates(u.release, hend));
+    }
     if let (Some(hend), Some(hq)) = (horizon_end, horizon_q) {
         let mut q = u.orig_q;
         loop {
@@ -1278,6 +1273,7 @@ fn place_asap_start_in(
             cands.push(c);
         }
     }
+    cands.extend(pool.bay_count_change_candidates(earliest, latest_start));
     // Quarter boundaries in range (variable bay counts can increase there).
     let mut q = (earliest.year() as i64, quarter_of(earliest));
     loop {
@@ -1576,6 +1572,7 @@ mod tests {
                 bays: 1,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -1637,6 +1634,7 @@ mod tests {
                     bays: 2,
                     changeover_days: 0,
                     bay_counts_by_quarter: vec![],
+                    bay_counts_by_week: vec![],
                 },
                 FactoryInput {
                     id: "fB".into(),
@@ -1644,6 +1642,7 @@ mod tests {
                     bays: 2,
                     changeover_days: 0,
                     bay_counts_by_quarter: vec![],
+                    bay_counts_by_week: vec![],
                 },
             ],
             products: vec![ProductInput {
@@ -1698,6 +1697,7 @@ mod tests {
                 bays: 4,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -1751,6 +1751,7 @@ mod tests {
                     quarter: 3,
                     bays: 1,
                 }],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -1806,6 +1807,7 @@ mod tests {
                     quarter: 3,
                     bays: 4,
                 }],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -1834,6 +1836,46 @@ mod tests {
     }
 
     #[test]
+    fn variable_bays_week_override_limits_capacity() {
+        let s = ScheduleInput {
+            factories: vec![FactoryInput {
+                id: "f1".into(),
+                name: "F1".into(),
+                bays: 4,
+                changeover_days: 0,
+                bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![BayWeekInput {
+                    week_start: ymd(2026, 9, 27),
+                    bays: 1,
+                }],
+            }],
+            products: vec![ProductInput {
+                id: "p1".into(),
+                name: "P".into(),
+                lead_times: vec![LeadTimeInput {
+                    year: 2026,
+                    quarter: 3,
+                    lead_time_days: 5,
+                }],
+                factory_lead_times: vec![],
+                factory_allocations: vec![],
+            }],
+            demand: vec![DemandInput {
+                id: "d1".into(),
+                product_id: "p1".into(),
+                period_type: "month".into(),
+                year: 2026,
+                period_index: 9,
+                quantity: 3,
+                spread_mode: "end".into(),
+            }],
+        };
+        let out = run_schedule(&s);
+        assert_eq!(out.shipped_on_time, 1);
+        assert_eq!(out.shipped_late, 2);
+    }
+
+    #[test]
     fn factory_lead_time_override_changes_window_length() {
         // Base LT = 5 days (fits Q3, on time). A 20-day override at the only
         // factory makes the *same* unit occupy a 20-day window instead, proving
@@ -1845,6 +1887,7 @@ mod tests {
                 bays: 1,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -1898,6 +1941,7 @@ mod tests {
                 bays: 4,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -1952,13 +1996,14 @@ mod tests {
             bays: 3,
             changeover_days: 0,
             bay_counts_by_quarter: vec![],
+            bay_counts_by_week: vec![],
         }];
         let mut pool = BayPool::from_factories_with(&facs, BayAssignment::MaximizeUtilization);
         pool.reserve(0, ymd(2026, 1, 1), ymd(2026, 1, 10));
         pool.reserve(1, ymd(2026, 1, 1), ymd(2026, 1, 20));
 
         let (s, f, idx) = pool
-            .find_free_window(|_fid| (ymd(2026, 1, 25), ymd(2026, 1, 30)))
+            .find_free_window_where(|_fid| (ymd(2026, 1, 25), ymd(2026, 1, 30)), |_fid| true)
             .expect("a free bay");
         assert_eq!(idx, 1, "should reuse the bay leaving the smallest gap");
         assert_eq!((s, f), (ymd(2026, 1, 25), ymd(2026, 1, 30)));
@@ -1973,13 +2018,14 @@ mod tests {
             bays: 3,
             changeover_days: 0,
             bay_counts_by_quarter: vec![],
+            bay_counts_by_week: vec![],
         }];
         let mut pool = BayPool::from_factories_with(&facs, BayAssignment::BalanceLoad);
         pool.reserve(0, ymd(2026, 1, 1), ymd(2026, 1, 10));
         pool.reserve(1, ymd(2026, 1, 1), ymd(2026, 1, 20));
 
         let (_, _, idx) = pool
-            .find_free_window(|_fid| (ymd(2026, 1, 25), ymd(2026, 1, 30)))
+            .find_free_window_where(|_fid| (ymd(2026, 1, 25), ymd(2026, 1, 30)), |_fid| true)
             .expect("a free bay");
         assert_eq!(idx, 2, "load-balancing should pick the empty bay");
     }
@@ -1997,6 +2043,7 @@ mod tests {
                     bays: 1,
                     changeover_days: 0,
                     bay_counts_by_quarter: vec![],
+                    bay_counts_by_week: vec![],
                 },
                 FactoryInput {
                     id: "f2".into(),
@@ -2004,6 +2051,7 @@ mod tests {
                     bays: 1,
                     changeover_days: 0,
                     bay_counts_by_quarter: vec![],
+                    bay_counts_by_week: vec![],
                 },
             ],
             products: vec![ProductInput {
@@ -2062,6 +2110,7 @@ mod tests {
                         bays: 4,
                     },
                 ],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -2128,6 +2177,7 @@ mod tests {
                 bays: 1,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -2192,6 +2242,7 @@ mod tests {
                 bays: 1,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -2239,6 +2290,7 @@ mod tests {
                 bays: 2,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             }],
             products: vec![ProductInput {
                 id: "p1".into(),
@@ -2318,6 +2370,7 @@ mod tests {
                 bays,
                 changeover_days: 0,
                 bay_counts_by_quarter: vec![],
+                bay_counts_by_week: vec![],
             })
             .collect();
         // Define lead times generously across years so roll-offs find an LT.
@@ -2413,6 +2466,7 @@ mod tests {
                     bays: 4,
                     changeover_days: 0,
                     bay_counts_by_quarter: vec![],
+                    bay_counts_by_week: vec![],
                 },
                 FactoryInput {
                     id: "f2".into(),
@@ -2420,6 +2474,7 @@ mod tests {
                     bays: 4,
                     changeover_days: 0,
                     bay_counts_by_quarter: vec![],
+                    bay_counts_by_week: vec![],
                 },
             ],
             products: vec![ProductInput {

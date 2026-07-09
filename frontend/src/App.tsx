@@ -2,52 +2,24 @@ import { lazy, Suspense, useEffect, useState } from 'react'
 import {
   Factory as FactoryIcon,
   Building2,
-  Package,
-  ListChecks,
-  Play,
   BarChart3,
   Download,
-  MessageCircle,
   Table2,
-  LayoutGrid,
-  Users,
 } from 'lucide-react'
 import * as api from './api'
-import type { Demand, Factory, Product, RunResult, Scenario } from './types'
+import type { Factory, Product, RunResult, Scenario, ScenarioOrder } from './types'
 import { ScenarioSwitcher } from './components/ScenarioSwitcher'
 import { FactoryEditor } from './components/FactoryEditor'
-import { ProductEditor } from './components/ProductEditor'
-import { DemandEditor } from './components/DemandEditor'
-import { RunView } from './components/RunView'
 const GanttView = lazy(() =>
   import('./components/GanttView').then((m) => ({ default: m.GanttView })),
 )
-import { ShipmentSummary } from './components/ShipmentSummary'
-import { RecommendationPanel } from './components/RecommendationPanel'
-import { UnshippableList } from './components/UnshippableList'
-import { BacklogView } from './components/BacklogView'
 import { ReportView } from './components/ReportView'
-const BayRequirementsView = lazy(() =>
-  import('./components/BayRequirementsView').then((m) => ({ default: m.BayRequirementsView })),
-)
-const HeadcountView = lazy(() =>
-  import('./components/HeadcountView').then((m) => ({ default: m.HeadcountView })),
-)
-const AgentChat = lazy(() =>
-  import('./components/AgentChat').then((m) => ({ default: m.AgentChat })),
-)
 import './App.css'
 
 type Tab =
   | 'factories'
-  | 'products'
-  | 'demand'
-  | 'run'
   | 'results'
-  | 'bays'
-  | 'headcount'
   | 'report'
-  | 'agent'
 
 const ACTIVE_SCENARIO_KEY = 'factoryplan.activeScenarioId'
 
@@ -64,7 +36,7 @@ function App() {
   const [resultContext, setResultContext] = useState<{
     factories: Factory[]
     products: Product[]
-    demand: Demand[]
+    orders: ScenarioOrder[]
   } | null>(null)
 
   async function reloadScenarios() {
@@ -113,15 +85,9 @@ function App() {
   }
 
   const tabs: Array<{ key: Tab; label: string; icon: typeof FactoryIcon }> = [
-    { key: 'factories', label: 'Factories', icon: Building2 },
-    { key: 'products', label: 'Products', icon: Package },
-    { key: 'demand', label: 'Demand', icon: ListChecks },
-    { key: 'run', label: 'Run', icon: Play },
+    { key: 'factories', label: 'Plan', icon: Building2 },
     { key: 'results', label: 'Results', icon: BarChart3 },
-    { key: 'bays', label: 'Bay Req', icon: LayoutGrid },
-    { key: 'headcount', label: 'Headcount', icon: Users },
     { key: 'report', label: 'Report', icon: Table2 },
-    { key: 'agent', label: 'Agent', icon: MessageCircle },
   ]
 
   return (
@@ -129,7 +95,7 @@ function App() {
       <header className="border-b border-slate-200 bg-white">
         <div className="max-w-6xl mx-auto px-6 py-3 flex items-center gap-3">
           <FactoryIcon className="w-6 h-6 text-indigo-600" />
-          <h1 className="text-lg font-semibold">factoryplan-rust</h1>
+          <h1 className="text-lg font-semibold">factoryplanMS</h1>
         </div>
       </header>
 
@@ -171,14 +137,9 @@ function App() {
           </div>
         ) : (
           <>
-            {tab === 'factories' && <FactoryEditor scenarioId={activeId} />}
-            {tab === 'products' && <ProductEditor scenarioId={activeId} />}
-            {tab === 'demand' && <DemandEditor scenarioId={activeId} />}
-            {tab === 'run' && (
-              <RunView
+            {tab === 'factories' && (
+              <FactoryEditor
                 scenarioId={activeId}
-                result={result}
-                resultContext={resultContext}
                 onResult={(r, ctx) => {
                   setResult(r)
                   setResultContext(ctx)
@@ -187,40 +148,14 @@ function App() {
               />
             )}
             {tab === 'results' && (
-              <ResultsTab result={result} context={resultContext} onGoToRun={() => setTab('run')} />
-            )}
-            {tab === 'bays' && (
-              <Suspense
-                fallback={<div className="p-6 text-slate-500 text-sm">Loading…</div>}
-              >
-                <BayRequirementsView scenarioId={activeId} />
-              </Suspense>
-            )}
-            {tab === 'headcount' && (
-              <Suspense
-                fallback={<div className="p-6 text-slate-500 text-sm">Loading…</div>}
-              >
-                <HeadcountView
-                  scenarioId={activeId}
-                  result={result}
-                  context={resultContext}
-                  onGoToRun={() => setTab('run')}
-                />
-              </Suspense>
+              <ResultsTab result={result} context={resultContext} onGoToRun={() => setTab('factories')} />
             )}
             {tab === 'report' && (
               <ReportView
                 result={result}
                 context={resultContext}
-                onGoToRun={() => setTab('run')}
+                onGoToRun={() => setTab('factories')}
               />
-            )}
-            {tab === 'agent' && (
-              <Suspense
-                fallback={<div className="p-6 text-slate-500 text-sm">Loading agent…</div>}
-              >
-                <AgentChat scenarioId={activeId} />
-              </Suspense>
             )}
           </>
         )}
@@ -231,7 +166,7 @@ function App() {
 
 interface ResultsTabProps {
   result: RunResult | null
-  context: { factories: Factory[]; products: Product[]; demand: Demand[] } | null
+  context: { factories: Factory[]; products: Product[]; orders: ScenarioOrder[] } | null
   onGoToRun: () => void
 }
 
@@ -241,7 +176,7 @@ function ResultsTab({ result, context, onGoToRun }: ResultsTabProps) {
       <div className="rounded-lg border border-dashed border-slate-300 p-10 text-center text-slate-500 text-sm">
         No results yet.{' '}
         <button className="text-indigo-600 hover:underline" onClick={onGoToRun}>
-          Go to the Run tab
+          Go to the Plan tab
         </button>{' '}
         to compute a schedule.
       </div>
@@ -265,26 +200,24 @@ function ResultsTab({ result, context, onGoToRun }: ResultsTabProps) {
           XLSX
         </a>
       </div>
-      <RecommendationPanel
-        recommendation={result.recommendation}
-        totalDemand={result.run.total_demand}
-        shipped={result.run.shipped_on_time}
-        shippedLate={result.run.shipped_late}
-        unshippable={result.run.unshippable}
-      />
-      <section>
-        <h3 className="text-sm font-semibold text-slate-700 mb-2">Quarterly backlog</h3>
-        <BacklogView result={result} />
-      </section>
-      <section>
-        <h3 className="text-sm font-semibold text-slate-700 mb-2">Shipment summary</h3>
-        <ShipmentSummary
-          result={result}
-          demand={context.demand}
-          products={context.products}
-          factories={context.factories}
-        />
-      </section>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+        <div className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="text-slate-500">UTID orders</div>
+          <div className="text-xl font-semibold">{result.run.total_demand}</div>
+        </div>
+        <div className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="text-slate-500">Scheduled</div>
+          <div className="text-xl font-semibold">{result.run.shipped_on_time}</div>
+        </div>
+        <div className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="text-slate-500">Unscheduled</div>
+          <div className="text-xl font-semibold">{result.run.unshippable}</div>
+        </div>
+        <div className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="text-slate-500">Factories</div>
+          <div className="text-xl font-semibold">{context.factories.length}</div>
+        </div>
+      </div>
       <section>
         <h3 className="text-sm font-semibold text-slate-700 mb-2">Gantt by factory</h3>
         <Suspense
@@ -294,19 +227,9 @@ function ResultsTab({ result, context, onGoToRun }: ResultsTabProps) {
             </div>
           }
         >
-          <GanttView
-            result={result}
-            factories={context.factories}
-            products={context.products}
-          />
+          <GanttView result={result} factories={context.factories} products={context.products} />
         </Suspense>
       </section>
-      {result.run.unshippable > 0 && (
-        <section>
-          <h3 className="text-sm font-semibold text-slate-700 mb-2">Unshippable units</h3>
-          <UnshippableList result={result} products={context.products} />
-        </section>
-      )}
     </div>
   )
 }

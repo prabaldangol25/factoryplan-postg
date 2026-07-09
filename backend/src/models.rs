@@ -44,7 +44,15 @@ pub struct BayCountRow {
     pub bays: i64,
 }
 
-/// Composite Factory returned to API clients — base bays + per-quarter overrides.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct BayWeekRow {
+    pub id: String,
+    pub factory_id: String,
+    pub week_start: String,
+    pub bays: i64,
+}
+
+/// Composite Factory returned to API clients — base bays + per-period overrides.
 #[derive(Debug, Clone, Serialize)]
 pub struct FactoryWithBayCounts {
     pub id: String,
@@ -53,12 +61,19 @@ pub struct FactoryWithBayCounts {
     pub bays: i64,
     pub changeover_days: i64,
     pub bay_counts: Vec<BayCountRow>,
+    pub bay_weeks: Vec<BayWeekRow>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct BayCountInput {
     pub year: i64,
     pub quarter: i64,
+    pub bays: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BayWeekInput {
+    pub week_start: String,
     pub bays: i64,
 }
 
@@ -70,6 +85,8 @@ pub struct CreateFactory {
     pub changeover_days: i64,
     #[serde(default)]
     pub bay_counts: Vec<BayCountInput>,
+    #[serde(default)]
+    pub bay_weeks: Vec<BayWeekInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +97,8 @@ pub struct UpdateFactory {
     pub changeover_days: i64,
     #[serde(default)]
     pub bay_counts: Vec<BayCountInput>,
+    #[serde(default)]
+    pub bay_weeks: Vec<BayWeekInput>,
 }
 
 // ---------- Product + lead times ----------
@@ -182,6 +201,37 @@ pub struct UpdateProduct {
     pub factory_allocations: Vec<FactoryAllocationInput>,
 }
 
+// ---------- Scenario orders (consolidated factory/demand input) ----------
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ScenarioOrder {
+    pub id: String,
+    pub scenario_id: String,
+    pub utid: String,
+    pub build_type: String,
+    pub customer: String,
+    pub cycle_time_days: i64,
+    pub sort_order: i64,
+    pub due_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrderInput {
+    pub utid: String,
+    #[serde(default)]
+    pub build_type: String,
+    pub customer: String,
+    pub cycle_time_days: i64,
+    #[serde(default)]
+    pub due_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplaceOrders {
+    #[serde(default)]
+    pub orders: Vec<OrderInput>,
+}
+
 // ---------- Demand ----------
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -267,6 +317,8 @@ pub struct ScheduledUnit {
     pub serial: Option<String>,
     pub orig_due_date: Option<String>,
     pub is_late: bool,
+    #[serde(default)]
+    pub is_anchored: bool,
 }
 
 /// Per-quarter count of units that missed that quarter and rolled forward.

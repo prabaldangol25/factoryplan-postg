@@ -1,0 +1,1 @@
+ALTER TABLE scenario_order ADD COLUMN due_date TEXT;

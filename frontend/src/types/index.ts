@@ -14,6 +14,13 @@ export interface BayCountRow {
   bays: number
 }
 
+export interface BayWeekRow {
+  id: string
+  factory_id: string
+  week_start: string
+  bays: number
+}
+
 export interface Factory {
   id: string
   scenario_id: string
@@ -21,6 +28,7 @@ export interface Factory {
   bays: number
   changeover_days: number
   bay_counts: BayCountRow[]
+  bay_weeks: BayWeekRow[]
 }
 
 export interface LeadTimeRow {
@@ -56,6 +64,17 @@ export interface Product {
   lead_times: LeadTimeRow[]
   factory_lead_times: FactoryLeadTimeRow[]
   factory_allocations: FactoryAllocationRow[]
+}
+
+export interface ScenarioOrder {
+  id: string
+  scenario_id: string
+  utid: string
+  build_type: string
+  customer: string
+  cycle_time_days: number
+  sort_order: number
+  due_date?: string
 }
 
 export type PeriodType = 'month' | 'quarter'
@@ -107,6 +126,7 @@ export interface ScheduledUnit {
   serial: string | null
   orig_due_date: string | null
   is_late: boolean
+  is_anchored?: boolean
 }
 
 export interface PerProductLtTarget {

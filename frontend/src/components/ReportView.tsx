@@ -1,10 +1,10 @@
 import { useMemo, useState } from 'react'
 import { Copy, Check, ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
-import type { Factory, Product, RunResult } from '../types'
+import type { Factory, Product, RunResult, ScenarioOrder } from '../types'
 
 interface Props {
   result: RunResult | null
-  context: { factories: Factory[]; products: Product[] } | null
+  context: { factories: Factory[]; products: Product[]; orders?: ScenarioOrder[] } | null
   onGoToRun: () => void
 }
 
@@ -18,40 +18,35 @@ interface ColumnDef {
 
 interface ReportRow {
   serial: string
-  product: string
+  buildType: string
+  customer: string
   factory: string
-  demandedQuarter: string
   quarter: string
   shipDate: string
   startDate: string
-  status: string
   late: boolean
 }
 
 type ReportRowKey =
   | 'serial'
-  | 'product'
+  | 'buildType'
+  | 'customer'
   | 'factory'
-  | 'demandedQuarter'
   | 'quarter'
   | 'shipDate'
   | 'startDate'
-  | 'status'
 
 const COLUMN_DEFS: ColumnDef[] = [
-  { key: 'serial', label: 'Serial', type: 'string' },
-  { key: 'product', label: 'Product', type: 'string' },
+  { key: 'serial', label: 'UTID', type: 'string' },
+  { key: 'buildType', label: 'Build Type', type: 'string' },
+  { key: 'customer', label: 'Customer', type: 'string' },
   { key: 'factory', label: 'Factory', type: 'string' },
-  { key: 'demandedQuarter', label: 'Demanded quarter', type: 'quarter' },
   { key: 'quarter', label: 'Shipping quarter', type: 'quarter' },
   { key: 'shipDate', label: 'Ship date', type: 'date' },
   { key: 'startDate', label: 'Start date', type: 'date' },
-  { key: 'status', label: 'Status', type: 'string' },
 ]
 
 const COLUMNS = COLUMN_DEFS.map((c) => c.label)
-
-const STATUS_OPTIONS = ['All', 'shipped', 'shipped late', 'unshippable']
 
 type SortDir = 'asc' | 'desc' | null
 
@@ -102,21 +97,20 @@ export function ReportView({ result, context, onGoToRun }: Props) {
 
   const rows = useMemo<ReportRow[]>(() => {
     if (!result || !context) return []
-    const pname = new Map(context.products.map((p) => [p.id, p.name]))
     const fname = new Map(context.factories.map((f) => [f.id, f.name]))
+    const orderById = new Map((context.orders ?? []).map((o) => [o.id, o]))
     return result.units
       .map((u) => {
         const shipped = u.status === 'shipped'
-        const status = u.status === 'unshippable' ? 'unshippable' : u.is_late ? 'shipped late' : 'shipped'
+        const order = orderById.get(u.demand_id)
         return {
           serial: u.serial ?? '',
-          product: pname.get(u.product_id) ?? '(unknown)',
+          buildType: order?.build_type ?? '',
+          customer: order?.customer ?? u.product_id,
           factory: shipped && u.factory_id ? fname.get(u.factory_id) ?? '' : '',
-          demandedQuarter: quarterLabel(u.orig_due_date ?? u.due_date),
           quarter: quarterLabel(u.due_date),
           shipDate: u.due_date,
           startDate: shipped ? u.required_start : '',
-          status,
           late: u.is_late,
         }
       })
@@ -138,9 +132,6 @@ export function ReportView({ result, context, onGoToRun }: Props) {
       COLUMN_DEFS.every((col) => {
         const f = filters[col.key]
         if (!f) return true
-        if (col.key === 'status') {
-          return f === 'All' ? true : r.status === f
-        }
         return String(r[col.key]).toLowerCase().includes(f.toLowerCase())
       }),
     )
@@ -196,13 +187,12 @@ export function ReportView({ result, context, onGoToRun }: Props) {
       ...visibleRows.map((r) =>
         [
           r.serial,
-          r.product,
+          r.buildType,
+          r.customer,
           r.factory,
-          r.demandedQuarter,
           r.quarter,
           r.shipDate,
           r.startDate,
-          r.status,
         ].join('\t'),
       ),
     ].join('\n')
@@ -291,63 +281,27 @@ export function ReportView({ result, context, onGoToRun }: Props) {
             <tr className="bg-slate-50">
               {COLUMN_DEFS.map((col) => (
                 <th key={col.key} className="px-2 py-1.5 font-normal align-top">
-                  {col.key === 'status' ? (
-                    <select
-                      value={filters[col.key] ?? 'All'}
-                      onChange={(e) => setFilter(col.key, e.target.value)}
-                      className="w-full rounded border border-slate-300 bg-white px-1.5 py-1 text-xs text-slate-700 focus:border-indigo-400 focus:outline-none"
-                    >
-                      {STATUS_OPTIONS.map((opt) => (
-                        <option key={opt} value={opt}>
-                          {opt}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      type="text"
-                      value={filters[col.key] ?? ''}
-                      onChange={(e) => setFilter(col.key, e.target.value)}
-                      placeholder="Filter…"
-                      className="w-full rounded border border-slate-300 bg-white px-1.5 py-1 text-xs text-slate-700 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none"
-                    />
-                  )}
+                  <input
+                    type="text"
+                    value={filters[col.key] ?? ''}
+                    onChange={(e) => setFilter(col.key, e.target.value)}
+                    placeholder="Filter…"
+                    className="w-full rounded border border-slate-300 bg-white px-1.5 py-1 text-xs text-slate-700 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none"
+                  />
                 </th>
               ))}
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {visibleRows.map((r, i) => (
-              <tr
-                key={i}
-                className={
-                  r.status === 'unshippable'
-                    ? 'bg-rose-50/50'
-                    : r.late
-                      ? 'bg-amber-50/50'
-                      : undefined
-                }
-              >
+              <tr key={i}>
                 <td className="px-3 py-1.5 font-mono text-xs">{r.serial}</td>
-                <td className="px-3 py-1.5">{r.product}</td>
+                <td className="px-3 py-1.5">{r.buildType}</td>
+                <td className="px-3 py-1.5">{r.customer}</td>
                 <td className="px-3 py-1.5">{r.factory}</td>
-                <td className="px-3 py-1.5 whitespace-nowrap text-slate-500">
-                  {r.demandedQuarter}
-                </td>
                 <td className="px-3 py-1.5 whitespace-nowrap">{r.quarter}</td>
                 <td className="px-3 py-1.5 whitespace-nowrap">{r.shipDate}</td>
                 <td className="px-3 py-1.5 whitespace-nowrap">{r.startDate}</td>
-                <td
-                  className={`px-3 py-1.5 whitespace-nowrap ${
-                    r.status === 'unshippable'
-                      ? 'text-rose-600'
-                      : r.late
-                        ? 'text-amber-600'
-                        : 'text-emerald-700'
-                  }`}
-                >
-                  {r.status}
-                </td>
               </tr>
             ))}
           </tbody>

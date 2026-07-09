@@ -1,0 +1,1 @@
+ALTER TABLE scheduled_unit ADD COLUMN is_anchored BOOLEAN DEFAULT FALSE;

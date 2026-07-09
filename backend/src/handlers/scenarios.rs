@@ -81,6 +81,21 @@ async fn create_scenario(
                     .execute(&mut *tx)
                     .await?;
             }
+            let bws = sqlx::query_as::<_, BayWeekRow>(
+                "SELECT id, factory_id, week_start, bays FROM factory_bay_week WHERE factory_id = $1",
+            )
+            .bind(&f.id)
+            .fetch_all(&mut *tx)
+            .await?;
+            for bw in bws {
+                sqlx::query("INSERT INTO factory_bay_week (id, factory_id, week_start, bays) VALUES ($1, $2, $3, $4)")
+                    .bind(new_id())
+                    .bind(&new_fid)
+                    .bind(&bw.week_start)
+                    .bind(bw.bays)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             factory_id_map.insert(f.id, new_fid);
         }
 
@@ -158,6 +173,25 @@ async fn create_scenario(
                     .await?;
             }
             product_id_map.insert(p.id, new_pid);
+        }
+
+        let orders = sqlx::query_as::<_, ScenarioOrder>(
+            "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order FROM scenario_order WHERE scenario_id = $1",
+        )
+        .bind(src_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for o in orders {
+            sqlx::query("INSERT INTO scenario_order (id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+                .bind(new_id())
+                .bind(&id)
+                .bind(&o.utid)
+                .bind(&o.build_type)
+                .bind(&o.customer)
+                .bind(o.cycle_time_days)
+                .bind(o.sort_order)
+                .execute(&mut *tx)
+                .await?;
         }
 
         // demand (remap product_id)
