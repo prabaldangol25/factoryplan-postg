@@ -15,10 +15,42 @@ import type {
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/$/, '')
 const apiUrl = (path: string) => `${apiBaseUrl}${path}`
+const AUTH_TOKEN_KEY = 'factoryplan.authToken'
+
+export function getAuthToken(): string | null {
+  return localStorage.getItem(AUTH_TOKEN_KEY)
+}
+
+export function setAuthToken(token: string | null) {
+  if (token) localStorage.setItem(AUTH_TOKEN_KEY, token)
+  else localStorage.removeItem(AUTH_TOKEN_KEY)
+}
+
+export function clearAuthToken() {
+  setAuthToken(null)
+}
+
+function authHeaders(): Record<string, string> {
+  const token = getAuthToken()
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+function authUrl(path: string): string {
+  const token = getAuthToken()
+  if (!token) return apiUrl(path)
+  const sep = path.includes('?') ? '&' : '?'
+  return apiUrl(`${path}${sep}auth_token=${encodeURIComponent(token)}`)
+}
 
 const client = axios.create({
   baseURL: apiBaseUrl || '/',
   headers: { 'Content-Type': 'application/json' },
+})
+
+client.interceptors.request.use((config) => {
+  const token = getAuthToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
 })
 
 export interface ApiError {
@@ -39,10 +71,33 @@ function rethrow(err: unknown): never {
   throw err
 }
 
-// ---------- health ----------
+// ---------- health / auth ----------
 export async function getHealth(): Promise<{ status: string; service: string; version: string }> {
   return client
     .get('/api/health')
+    .then((r) => r.data)
+    .catch(rethrow)
+}
+
+export interface AuthStatus {
+  enabled: boolean
+  authenticated: boolean
+  token?: string | null
+}
+
+export async function login(password: string): Promise<AuthStatus> {
+  return client
+    .post('/api/auth/login', { password })
+    .then((r) => {
+      if (r.data.token) setAuthToken(r.data.token)
+      return r.data
+    })
+    .catch(rethrow)
+}
+
+export async function checkAuth(): Promise<AuthStatus> {
+  return client
+    .get('/api/auth/check')
     .then((r) => r.data)
     .catch(rethrow)
 }
@@ -288,18 +343,18 @@ export async function importDemandExcel(
   form.append('file', file)
   return axios
     .post(apiUrl(`/api/scenarios/${scenarioId}/demand/import-excel`), form, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      headers: { 'Content-Type': 'multipart/form-data', ...authHeaders() },
     })
     .then((r) => r.data)
     .catch(rethrow)
 }
 
 export function exportRunCsvUrl(runId: string): string {
-  return apiUrl(`/api/runs/${runId}/export.csv`)
+  return authUrl(`/api/runs/${runId}/export.csv`)
 }
 
 export function exportRunXlsxUrl(runId: string): string {
-  return apiUrl(`/api/runs/${runId}/export.xlsx`)
+  return authUrl(`/api/runs/${runId}/export.xlsx`)
 }
 
 // ---------- agent (Devin-powered scheduling chat) ----------
@@ -349,7 +404,7 @@ export function sendAgentMessage(
     try {
       const res = await fetch(apiUrl('/api/agent/chat'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           scenario_id: params.scenarioId,
           message: params.message,

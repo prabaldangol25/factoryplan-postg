@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState, type FormEvent } from 'react'
 import {
   Factory as FactoryIcon,
   Building2,
@@ -30,6 +30,8 @@ function App() {
   )
   const [tab, setTab] = useState<Tab>('factories')
   const [bootError, setBootError] = useState<string | null>(null)
+  const [authChecked, setAuthChecked] = useState(false)
+  const [authenticated, setAuthenticated] = useState(false)
 
   // Lifted state so results survive tab switches
   const [result, setResult] = useState<RunResult | null>(null)
@@ -50,12 +52,27 @@ function App() {
         setActiveId(list[0].id)
       }
     } catch (e: unknown) {
+      if ((e as { status?: number }).status === 401) {
+        api.clearAuthToken()
+        setAuthenticated(false)
+        return
+      }
       setBootError(((e as { message?: string }).message) ?? 'failed to load scenarios')
     }
   }
 
   useEffect(() => {
-    void reloadScenarios()
+    void (async () => {
+      try {
+        const auth = await api.checkAuth()
+        setAuthenticated(auth.authenticated)
+        if (auth.authenticated) await reloadScenarios()
+      } catch (e: unknown) {
+        setBootError(((e as { message?: string }).message) ?? 'failed to check authentication')
+      } finally {
+        setAuthChecked(true)
+      }
+    })()
   }, [])
 
   useEffect(() => {
@@ -68,6 +85,25 @@ function App() {
     setResult(null)
     setResultContext(null)
   }, [activeId])
+
+  async function handleLogin(password: string) {
+    const auth = await api.login(password)
+    if (!auth.authenticated) throw new Error('invalid password')
+    setAuthenticated(true)
+    await reloadScenarios()
+  }
+
+  if (!authChecked) {
+    return (
+      <div className="min-h-full flex items-center justify-center bg-slate-50 p-6 text-sm text-slate-500">
+        Loading factoryplanMS…
+      </div>
+    )
+  }
+
+  if (!authenticated) {
+    return <LoginGate onLogin={handleLogin} />
+  }
 
   if (bootError) {
     return (
@@ -160,6 +196,61 @@ function App() {
           </>
         )}
       </main>
+    </div>
+  )
+}
+
+interface LoginGateProps {
+  onLogin: (password: string) => Promise<void>
+}
+
+function LoginGate({ onLogin }: LoginGateProps) {
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    setSubmitting(true)
+    setError(null)
+    try {
+      await onLogin(password)
+    } catch (err: unknown) {
+      setError(((err as { message?: string }).message) ?? 'login failed')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="min-h-full bg-slate-950 flex items-center justify-center p-6">
+      <form onSubmit={submit} className="w-full max-w-sm rounded-2xl border border-slate-800 bg-white p-6 shadow-2xl">
+        <div className="flex items-center gap-3 mb-5">
+          <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center">
+            <FactoryIcon className="w-5 h-5 text-white" />
+          </div>
+          <div>
+            <div className="text-lg font-semibold text-slate-900">factoryplanMS</div>
+            <div className="text-xs text-slate-500">Private planning workspace</div>
+          </div>
+        </div>
+        <label className="block text-sm font-medium text-slate-700 mb-1">Shared password</label>
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none"
+          autoFocus
+        />
+        {error && <div className="mt-2 text-sm text-rose-600">{error}</div>}
+        <button
+          type="submit"
+          disabled={submitting || !password}
+          className="mt-4 w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+        >
+          {submitting ? 'Unlocking…' : 'Unlock app'}
+        </button>
+      </form>
     </div>
   )
 }

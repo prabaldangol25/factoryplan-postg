@@ -964,7 +964,10 @@ mod plan_tests {
             shipped_starts,
             vec!["2026-08-02", "2026-08-09", "2026-08-16", "2026-08-23"]
         );
-        assert_eq!(units.iter().filter(|u| u.status == "unshippable").count(), 2);
+        assert_eq!(
+            units.iter().filter(|u| u.status == "unshippable").count(),
+            2
+        );
     }
 
     #[test]
