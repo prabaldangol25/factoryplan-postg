@@ -26,6 +26,7 @@ export function AgentChat({ scenarioId }: Props) {
   const [loadingHistory, setLoadingHistory] = useState(false)
 
   const abortRef = useRef<AbortController | null>(null)
+  const optimisticMessageIdRef = useRef(0)
   const scrollRef = useRef<HTMLDivElement | null>(null)
 
   // Load conversation list when the scenario changes.
@@ -86,7 +87,7 @@ export function AgentChat({ scenarioId }: Props) {
 
     // Optimistically show the user's message.
     const optimistic: AgentMessage = {
-      id: `tmp-${Date.now()}`,
+      id: `tmp-${++optimisticMessageIdRef.current}`,
       conversation_id: activeConvId ?? '',
       role: 'user',
       content: message,

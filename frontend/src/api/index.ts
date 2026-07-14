@@ -36,13 +36,6 @@ function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
-function authUrl(path: string): string {
-  const token = getAuthToken()
-  if (!token) return apiUrl(path)
-  const sep = path.includes('?') ? '&' : '?'
-  return apiUrl(`${path}${sep}auth_token=${encodeURIComponent(token)}`)
-}
-
 const client = axios.create({
   baseURL: apiBaseUrl || '/',
   headers: { 'Content-Type': 'application/json' },
@@ -381,12 +374,18 @@ export async function importDemandExcel(
     .catch(rethrow)
 }
 
-export function exportRunCsvUrl(runId: string): string {
-  return authUrl(`/api/runs/${runId}/export.csv`)
-}
-
-export function exportRunXlsxUrl(runId: string): string {
-  return authUrl(`/api/runs/${runId}/export.xlsx`)
+export async function downloadRunExport(runId: string, format: 'csv' | 'xlsx'): Promise<void> {
+  const response = await client
+    .get(`/api/runs/${runId}/export.${format}`, { responseType: 'blob' })
+    .catch(rethrow)
+  const url = URL.createObjectURL(response.data)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `factoryplan-run-${runId}.${format}`
+  document.body.append(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
 }
 
 // ---------- agent (Devin-powered scheduling chat) ----------

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Play, Loader2 } from 'lucide-react'
 import type { Factory, Product, RunResult, ScenarioOrder } from '../types'
 import * as api from '../api'
@@ -20,7 +20,7 @@ export function RunView({ scenarioId, result, onResult }: Props) {
   const [error, setError] = useState<string | null>(null)
 
 
-  async function loadContext() {
+  const loadContext = useCallback(async () => {
     try {
       setError(null)
       const [f, o] = await Promise.all([
@@ -34,12 +34,11 @@ export function RunView({ scenarioId, result, onResult }: Props) {
       setError(((e as { message?: string }).message) ?? 'failed to load scenario data')
       return null
     }
-  }
+  }, [scenarioId])
 
   useEffect(() => {
     void loadContext()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenarioId])
+  }, [loadContext])
 
   async function handleRun() {
     setRunning(true)

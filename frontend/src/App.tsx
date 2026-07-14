@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState, type FormEvent } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useState, type FormEvent } from 'react'
 import {
   Factory as FactoryIcon,
   Building2,
@@ -40,7 +40,7 @@ function App() {
     orders: ScenarioOrder[]
   } | null>(null)
 
-  async function reloadScenarios() {
+  const reloadScenarios = useCallback(async () => {
     try {
       const list = await api.listScenarios()
       setScenarios(list)
@@ -58,7 +58,7 @@ function App() {
       }
       setBootError(((e as { message?: string }).message) ?? 'failed to load scenarios')
     }
-  }
+  }, [activeId])
 
   useEffect(() => {
     void (async () => {
@@ -72,18 +72,18 @@ function App() {
         setAuthChecked(true)
       }
     })()
-  }, [])
+  }, [reloadScenarios])
 
   useEffect(() => {
     if (activeId) localStorage.setItem(ACTIVE_SCENARIO_KEY, activeId)
     else localStorage.removeItem(ACTIVE_SCENARIO_KEY)
   }, [activeId])
 
-  // Clear result whenever scenario changes
-  useEffect(() => {
+  function handleScenarioChange(id: string | null) {
+    setActiveId(id)
     setResult(null)
     setResultContext(null)
-  }, [activeId])
+  }
 
   async function handleLogin(password: string) {
     const auth = await api.login(password)
@@ -137,7 +137,7 @@ function App() {
       <ScenarioSwitcher
         scenarios={scenarios}
         activeId={activeId}
-        onChange={setActiveId}
+        onChange={handleScenarioChange}
         onReload={reloadScenarios}
       />
 

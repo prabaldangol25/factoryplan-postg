@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Plus, Trash2, Save, ChevronDown, ChevronRight } from 'lucide-react'
 import type { Factory, Product } from '../types'
 import * as api from '../api'
@@ -96,7 +96,7 @@ export function ProductEditor({ scenarioId }: Props) {
     return { from: y, to: y + 1 }
   })
 
-  async function reload() {
+  const reload = useCallback(async () => {
     try {
       setError(null)
       const [list, facs] = await Promise.all([
@@ -119,7 +119,7 @@ export function ProductEditor({ scenarioId }: Props) {
     } catch (e: unknown) {
       setError(((e as { message?: string }).message) ?? 'load failed')
     }
-  }
+  }, [scenarioId])
   useEffect(() => {
     setProducts([])
     setFactories([])
@@ -127,7 +127,7 @@ export function ProductEditor({ scenarioId }: Props) {
     setDrafts({})
     setNewDraft(emptyDraft())
     if (scenarioId) void reload()
-  }, [scenarioId])
+  }, [scenarioId, reload])
 
   function initDraft(p: Product): Draft {
     const matrix: Record<string, LtCell> = {}

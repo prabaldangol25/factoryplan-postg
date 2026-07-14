@@ -14,7 +14,14 @@ use actix_web::{
     middleware::{from_fn, Next},
     post, web, App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::db::Pool;
 
@@ -53,36 +60,52 @@ fn configured_password() -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
-fn token_for_password(password: &str) -> String {
-    let mut out = String::with_capacity(password.len() * 2);
-    for b in password.as_bytes() {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
+static SESSIONS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn session_ttl() -> Duration {
+    let hours = std::env::var("APP_SESSION_TTL_HOURS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|hours| *hours > 0)
+        .unwrap_or(12);
+    Duration::from_secs(hours * 60 * 60)
 }
 
-fn request_token(req: &HttpRequest) -> Option<String> {
-    if let Some(header) = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(token) = header.strip_prefix("Bearer ") {
-            return Some(token.trim().to_string());
-        }
-    }
+fn issue_session() -> String {
+    let token = Uuid::new_v4().to_string();
+    let expires_at = Instant::now() + session_ttl();
+    let mut sessions = SESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("session lock poisoned");
+    sessions.retain(|_, expiry| *expiry > Instant::now());
+    sessions.insert(token.clone(), expires_at);
+    token
+}
 
-    req.query_string().split('&').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        (key == "auth_token" && !value.is_empty()).then(|| value.to_string())
-    })
+fn request_token(req: &HttpRequest) -> Option<&str> {
+    req.headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
 }
 
 fn request_is_authenticated(req: &HttpRequest) -> bool {
-    let Some(password) = configured_password() else {
+    if configured_password().is_none() {
         return true;
+    }
+    let Some(token) = request_token(req) else {
+        return false;
     };
-    request_token(req).as_deref() == Some(token_for_password(&password).as_str())
+    let mut sessions = SESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("session lock poisoned");
+    let now = Instant::now();
+    sessions.retain(|_, expiry| *expiry > now);
+    sessions.get(token).is_some_and(|expiry| *expiry > now)
 }
 
 #[post("/api/auth/login")]
@@ -99,7 +122,7 @@ async fn login(body: web::Json<LoginRequest>) -> HttpResponse {
         HttpResponse::Ok().json(AuthStatus {
             enabled: true,
             authenticated: true,
-            token: Some(token_for_password(&password)),
+            token: Some(issue_session()),
         })
     } else {
         HttpResponse::Unauthorized().json(AuthStatus {
@@ -162,7 +185,7 @@ async fn main() -> std::io::Result<()> {
         "postgresql://postgres:postgres@localhost:5432/factoryplan".to_string()
     });
 
-    log::info!("factoryplan-backend starting on {host}:{port}  (db={database_url})");
+    log::info!("factoryplan-backend starting on {host}:{port}");
 
     let pool: Pool = db::init_pool(&database_url)
         .await

@@ -158,7 +158,7 @@ frameworks later would be a few hours of work if needed.
 
 ## Configuration
 
-The backend reads three environment variables:
+The backend reads these environment variables:
 
 | Var | Default | Notes |
 |---|---|---|
@@ -167,6 +167,8 @@ The backend reads three environment variables:
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/factoryplan` | PostgreSQL connection URL |
 | `RUST_LOG` | `info` | Standard `env_logger` filter |
 | `DEVIN_CMD` | `devin` | Path to the `devin` CLI used by the Agent tab. Override if not on PATH. |
+| `APP_PASSWORD` | unset | Optional shared password that enables the login gate. |
+| `APP_SESSION_TTL_HOURS` | `12` | Lifetime of the opaque in-memory login session. Backend restarts invalidate active sessions. |
 
 The Agent tab requires the [`devin` CLI](https://cli.devin.ai/docs) installed,
 authenticated (`devin auth login`), and on PATH. The backend spawns it

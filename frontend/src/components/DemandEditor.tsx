@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plus, Trash2, Upload, Pencil, Check, X } from 'lucide-react'
 import type { Demand, PeriodType, Product, SerialMode, SpreadMode } from '../types'
 import * as api from '../api'
@@ -134,17 +134,15 @@ export function DemandEditor({ scenarioId }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const formRef = useRef<HTMLDivElement>(null)
 
-  async function reload() {
+  const reload = useCallback(async () => {
     try {
       setError(null)
       const [d, p] = await Promise.all([api.listDemand(scenarioId), api.listProducts(scenarioId)])
       setDemand(d)
       setProducts(p)
-      if (!form.product_id && p.length > 0) {
-        setForm((f) => ({ ...f, product_id: p[0].id }))
-      }
-      if (!bulkForm.product_id && p.length > 0) {
-        setBulkForm((f) => ({ ...f, product_id: p[0].id }))
+      if (p.length > 0) {
+        setForm((f) => (f.product_id ? f : { ...f, product_id: p[0].id }))
+        setBulkForm((f) => (f.product_id ? f : { ...f, product_id: p[0].id }))
       }
       const savedYears = d.map((row) => row.year)
       if (savedYears.length > 0) {
@@ -156,7 +154,7 @@ export function DemandEditor({ scenarioId }: Props) {
     } catch (e: unknown) {
       setError(((e as { message?: string }).message) ?? 'load failed')
     }
-  }
+  }, [scenarioId])
   useEffect(() => {
     setDemand([])
     setProducts([])
@@ -165,7 +163,7 @@ export function DemandEditor({ scenarioId }: Props) {
     setForm(emptyForm())
     setBulkForm({ product_id: '', spread_mode: 'even', serial_mode: 'none', serial_start: '', serial_list: '', matrix: {} })
     if (scenarioId) void reload()
-  }, [scenarioId])
+  }, [scenarioId, reload])
 
   const productMap = useMemo(() => {
     const m = new Map<string, Product>()

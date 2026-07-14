@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
+import type PlotComponent from 'react-plotly.js'
 import { Plus, Trash2, Pencil, Check, X, Play, Loader2, Anchor, BarChart3 } from 'lucide-react'
-import PlotComponent from 'react-plotly.js'
 import type { Factory, Product, RunResult, ScenarioOrder } from '../types'
 import * as api from '../api'
 
-const Plot = ((PlotComponent as unknown as { default?: typeof PlotComponent }).default ?? PlotComponent) as typeof PlotComponent
+const Plot = lazy(() => import('react-plotly.js'))
+type PlotProps = ComponentProps<typeof PlotComponent>
 
 interface DialProps {
   value: number
@@ -142,14 +143,6 @@ function Dial({ value, onChange, min = 1, max = 20 }: DialProps) {
       </div>
     </div>
   )
-}
-
-function debounce<T extends (...args: any[]) => any>(func: T, wait: number): (...args: Parameters<T>) => void {
-  let timeout: ReturnType<typeof setTimeout> | null = null
-  return (...args: Parameters<T>) => {
-    if (timeout) clearTimeout(timeout)
-    timeout = setTimeout(() => func(...args), wait)
-  }
 }
 
 interface Props {
@@ -308,6 +301,8 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set())
   const formRef = useRef<HTMLDivElement>(null)
+  const orderSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const orderSaveRequestRef = useRef(0)
   const [weekRange, setWeekRange] = useState<{ start: string; count: number }>(() => ({
     start: '2026-08-02',
     count: 129,
@@ -318,18 +313,27 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
   const [anchorDate, setAnchorDate] = useState('')
   const [anchorFactoryId, setAnchorFactoryId] = useState('')
 
-  const autoSaveOrders = useCallback(
-    debounce(async () => {
-      try {
-        const parsedOrders = parseOrderGridRows(orderRows)
-        const saved = await api.replaceOrders(scenarioId, parsedOrders)
-        setOrders(saved)
-      } catch (e: unknown) {
-        console.error('Auto-save failed:', e)
-      }
-    }, 1000),
-    [scenarioId, orderRows],
-  )
+  function scheduleOrderSave(rows: OrderGridRow[]) {
+    if (orderSaveTimerRef.current) clearTimeout(orderSaveTimerRef.current)
+    const requestId = ++orderSaveRequestRef.current
+    const ordersToSave = parseOrderGridRows(rows)
+    orderSaveTimerRef.current = setTimeout(() => {
+      void api
+        .replaceOrders(scenarioId, ordersToSave)
+        .then((saved) => {
+          if (requestId === orderSaveRequestRef.current) setOrders(saved)
+        })
+        .catch((e: unknown) => {
+          if (requestId === orderSaveRequestRef.current) {
+            setError(((e as { message?: string }).message) ?? 'auto-save failed')
+          }
+        })
+    }, 1000)
+  }
+
+  useEffect(() => () => {
+    if (orderSaveTimerRef.current) clearTimeout(orderSaveTimerRef.current)
+  }, [scenarioId])
 
   const reload = useCallback(async () => {
     try {
@@ -407,6 +411,22 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
     const autoStarts = Math.max(1, Math.ceil(plannedRows / weekCount))
     return { first, last, weekCount, plannedRows, autoStarts }
   }, [factories, orderRows, orders.length])
+
+  const weeklyGraphData: PlotProps['data'] = [{
+    x: Object.keys(form.weekMatrix).sort(),
+    y: Object.keys(form.weekMatrix).sort().map((week) => form.weekMatrix[week].bays),
+    type: 'bar',
+    marker: { color: '#4f46e5' },
+    name: 'Bays',
+  }]
+  const weeklyGraphLayout: PlotProps['layout'] = {
+    xaxis: { title: { text: 'Week' } },
+    yaxis: { title: { text: 'Bays Available' } },
+    margin: { l: 50, r: 20, t: 20, b: 50 },
+    height: 300,
+    plot_bgcolor: '#ffffff',
+    paper_bgcolor: '#ffffff',
+  }
 
   function startEdit(f: Factory) {
     setEditingId(f.id)
@@ -500,9 +520,10 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
       const next = rows.slice()
       while (next.length <= rowIndex) next.push(blankOrderRow())
       next[rowIndex] = { ...next[rowIndex], [field]: value }
-      return ensureBlankOrderRows(next)
+      const normalized = ensureBlankOrderRows(next)
+      scheduleOrderSave(normalized)
+      return normalized
     })
-    autoSaveOrders()
   }
 
   function handleOrderPaste(e: React.ClipboardEvent<HTMLInputElement>, rowIndex: number, colIndex: number) {
@@ -520,12 +541,15 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
         }
         next[rowIndex + r] = target
       }
-      return ensureBlankOrderRows(next)
+      const normalized = ensureBlankOrderRows(next)
+      scheduleOrderSave(normalized)
+      return normalized
     })
-    autoSaveOrders()
   }
 
   async function handleSaveOrders() {
+    if (orderSaveTimerRef.current) clearTimeout(orderSaveTimerRef.current)
+    orderSaveRequestRef.current++
     const parsed = parseOrderGridRows(orderRows)
     if (parsed.length === 0) {
       setError('enter rows with UTID, Customer, and Cycle Time in Days')
@@ -865,28 +889,13 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
             {showWeeklyGraph && (
               <div className="mt-4 p-4 border border-slate-200 rounded-lg bg-slate-50">
                 <h3 className="text-sm font-semibold text-slate-700 mb-3">Weekly Bay Availability</h3>
-                <Plot
-                  data={[
-                    {
-                      x: Object.keys(form.weekMatrix).sort() as any,
-                      y: Object.keys(form.weekMatrix)
-                        .sort()
-                        .map((w) => form.weekMatrix[w].bays) as any,
-                      type: 'bar' as const,
-                      marker: { color: '#4f46e5' },
-                      name: 'Bays',
-                    } as any,
-                  ]}
-                  layout={{
-                    xaxis: { title: 'Week' },
-                    yaxis: { title: 'Bays Available' },
-                    margin: { l: 50, r: 20, t: 20, b: 50 },
-                    height: 300,
-                    plot_bgcolor: '#ffffff',
-                    paper_bgcolor: '#ffffff',
-                  } as any}
-                  config={{ responsive: true, displayModeBar: false }}
-                />
+                <Suspense fallback={<div className="h-[300px] animate-pulse rounded bg-slate-100" />}>
+                  <Plot
+                    data={weeklyGraphData}
+                    layout={weeklyGraphLayout}
+                    config={{ responsive: true, displayModeBar: false }}
+                  />
+                </Suspense>
               </div>
             )}
           </div>
