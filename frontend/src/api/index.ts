@@ -9,6 +9,7 @@ import type {
   SpreadMode,
   SerialMode,
   RunResult,
+  ScheduleRun,
   AgentConversation,
   AgentMessage,
 } from '../types'
@@ -187,6 +188,7 @@ export interface OrderInput {
   customer: string
   cycle_time_days: number
   due_date?: string
+  anchor_factory_id?: string
 }
 
 export interface AnchorStatus {
@@ -314,14 +316,44 @@ export async function deleteDemand(id: string): Promise<void> {
 // ---------- run (Phase 2) ----------
 export type OptimizeMode = 'balance' | 'utilization'
 
+export async function listScenarioRuns(scenarioId: string): Promise<ScheduleRun[]> {
+  return client.get(`/api/scenarios/${scenarioId}/runs`).then((r) => r.data).catch(rethrow)
+}
+
+export async function getRun(runId: string): Promise<RunResult> {
+  return client.get(`/api/runs/${runId}`).then((r) => r.data).catch(rethrow)
+}
+
 export async function runScenario(
   scenarioId: string,
   optimize: OptimizeMode = 'balance',
   maxStartsPerWeek?: number | null,
+  factoryStartsPerWeek: Record<string, number> = {},
+  leadTimePct?: number | null,
+  factoryLeadTimePct: Record<string, number> = {},
+  leadTimeDays?: number | null,
+  factoryLeadTimeDays: Record<string, number> = {},
 ): Promise<RunResult> {
   const params: Record<string, string | number> = {}
   if (optimize === 'utilization') params.optimize = 'utilization'
   if (maxStartsPerWeek != null && maxStartsPerWeek > 0) params.max_starts_per_week = maxStartsPerWeek
+  const factoryLimits = Object.entries(factoryStartsPerWeek)
+    .filter(([, n]) => n > 0)
+    .map(([factoryId, n]) => `${factoryId}:${Math.trunc(n)}`)
+    .join(',')
+  if (factoryLimits) params.factory_starts_per_week = factoryLimits
+  if (leadTimePct != null && Number.isFinite(leadTimePct) && leadTimePct !== 0) params.lead_time_pct = leadTimePct
+  const factoryLeadTimes = Object.entries(factoryLeadTimePct)
+    .filter(([, n]) => Number.isFinite(n) && n !== 0)
+    .map(([factoryId, n]) => `${factoryId}:${n}`)
+    .join(',')
+  if (factoryLeadTimes) params.factory_lead_time_pct = factoryLeadTimes
+  if (leadTimeDays != null && Number.isFinite(leadTimeDays) && leadTimeDays !== 0) params.lead_time_days = leadTimeDays
+  const factoryLeadDays = Object.entries(factoryLeadTimeDays)
+    .filter(([, n]) => Number.isFinite(n) && n !== 0)
+    .map(([factoryId, n]) => `${factoryId}:${n}`)
+    .join(',')
+  if (factoryLeadDays) params.factory_lead_time_days = factoryLeadDays
   return client
     .post(`/api/scenarios/${scenarioId}/run`, null, { params })
     .then((r) => r.data)

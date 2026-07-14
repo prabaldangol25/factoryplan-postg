@@ -213,6 +213,7 @@ pub struct ScenarioOrder {
     pub cycle_time_days: i64,
     pub sort_order: i64,
     pub due_date: Option<String>,
+    pub anchor_factory_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,6 +225,8 @@ pub struct OrderInput {
     pub cycle_time_days: i64,
     #[serde(default)]
     pub due_date: Option<String>,
+    #[serde(default)]
+    pub anchor_factory_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

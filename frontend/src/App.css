@@ -79,6 +79,15 @@
   color: #4f46e5;
   text-decoration: underline;
 }
+
+.scrollbar-hidden {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-hidden::-webkit-scrollbar {
+  display: none;
+}
 .prose-chat strong {
   font-weight: 600;
 }

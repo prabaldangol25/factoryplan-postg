@@ -177,6 +177,7 @@ interface OrderGridRow {
   customer: string
   cycle_time_days: string
   due_date?: string
+  anchor_factory_id?: string
 }
 
 function parseWeekStart(raw: string): string | null {
@@ -217,7 +218,7 @@ function parsePastedNumbers(text: string): number[] {
 }
 
 function blankOrderRow(): OrderGridRow {
-  return { utid: '', build_type: '', customer: '', cycle_time_days: '', due_date: undefined }
+  return { utid: '', build_type: '', customer: '', cycle_time_days: '', due_date: undefined, anchor_factory_id: undefined }
 }
 
 function orderRowsFromSaved(rows: ScenarioOrder[]): OrderGridRow[] {
@@ -228,6 +229,7 @@ function orderRowsFromSaved(rows: ScenarioOrder[]): OrderGridRow[] {
       customer: r.customer,
       cycle_time_days: String(r.cycle_time_days),
       due_date: r.due_date,
+      anchor_factory_id: r.anchor_factory_id,
     })),
   )
 }
@@ -255,6 +257,7 @@ function parseOrderGridRows(rows: OrderGridRow[]): api.OrderInput[] {
       customer: r.customer.trim(),
       cycle_time_days: parseInt(r.cycle_time_days.trim(), 10),
       due_date: r.due_date,
+      anchor_factory_id: r.anchor_factory_id,
     }))
     .filter((r) => r.utid && r.customer && Number.isFinite(r.cycle_time_days) && r.cycle_time_days > 0)
 }
@@ -296,6 +299,11 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
   const [message, setMessage] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
   const [maxStartsPerWeek, setMaxStartsPerWeek] = useState(2)
+  const [leadTimePct, setLeadTimePct] = useState('0')
+  const [leadTimeDays, setLeadTimeDays] = useState('0')
+  const [factorySpacingOverrides, setFactorySpacingOverrides] = useState<Record<string, string>>({})
+  const [factoryLeadTimeOverrides, setFactoryLeadTimeOverrides] = useState<Record<string, string>>({})
+  const [factoryLeadTimeDayOverrides, setFactoryLeadTimeDayOverrides] = useState<Record<string, string>>({})
   const [form, setForm] = useState<FactoryForm>(emptyForm)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set())
@@ -306,6 +314,9 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
   }))
   const [showWeeklyGraph, setShowWeeklyGraph] = useState(false)
   const [anchorStatuses, setAnchorStatuses] = useState<Record<string, api.AnchorStatus>>({})
+  const [anchorDialogOpen, setAnchorDialogOpen] = useState(false)
+  const [anchorDate, setAnchorDate] = useState('')
+  const [anchorFactoryId, setAnchorFactoryId] = useState('')
 
   const autoSaveOrders = useCallback(
     debounce(async () => {
@@ -351,6 +362,40 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
         : [],
     [weekStartIso, weekRange.count],
   )
+
+  const factorySpacingLimits = useMemo(() => {
+    return Object.fromEntries(
+      Object.entries(factorySpacingOverrides)
+        .map(([factoryId, raw]) => [factoryId, parseInt(raw, 10)] as const)
+        .filter(([, n]) => Number.isFinite(n) && n > 0),
+    )
+  }, [factorySpacingOverrides])
+
+  const globalLeadTimePct = useMemo(() => {
+    const n = parseFloat(leadTimePct)
+    return Number.isFinite(n) ? n : 0
+  }, [leadTimePct])
+
+  const factoryLeadTimeLimits = useMemo(() => {
+    return Object.fromEntries(
+      Object.entries(factoryLeadTimeOverrides)
+        .map(([factoryId, raw]) => [factoryId, parseFloat(raw)] as const)
+        .filter(([, n]) => Number.isFinite(n) && n !== 0),
+    )
+  }, [factoryLeadTimeOverrides])
+
+  const globalLeadTimeDays = useMemo(() => {
+    const n = parseInt(leadTimeDays, 10)
+    return Number.isFinite(n) ? n : 0
+  }, [leadTimeDays])
+
+  const factoryLeadTimeDayLimits = useMemo(() => {
+    return Object.fromEntries(
+      Object.entries(factoryLeadTimeDayOverrides)
+        .map(([factoryId, raw]) => [factoryId, parseInt(raw, 10)] as const)
+        .filter(([, n]) => Number.isFinite(n) && n !== 0),
+    )
+  }, [factoryLeadTimeDayOverrides])
 
   const capacitySummary = useMemo(() => {
     const starts = factories.flatMap((f) => f.bay_weeks.map((w) => w.week_start)).sort()
@@ -499,60 +544,75 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
     }
   }
 
-  async function handleAnchor() {
-    const date = prompt('Enter the ship date (YYYY-MM-DD):')
-    if (!date) return
+  function selectedAnchorUtids() {
+    const selectedIndices = selectedRows.size > 0
+      ? Array.from(selectedRows)
+      : orderRows.map((_, i) => i).filter((i) => orderRows[i].utid || orderRows[i].customer)
+    return selectedIndices.map((i) => orderRows[i].utid.trim()).filter(Boolean)
+  }
 
-    const selectedIndices = selectedRows.size > 0 ? Array.from(selectedRows) : orderRows.map((_, i) => i).filter((i) => orderRows[i].utid || orderRows[i].customer)
-    const selectedUtids = selectedIndices.map((i) => orderRows[i].utid.trim()).filter(Boolean)
+  function openAnchorDialog() {
+    const selectedUtids = selectedAnchorUtids()
+    if (selectedUtids.length === 0) {
+      setError('No rows selected or no valid rows to anchor')
+      return
+    }
+    setError(null)
+    setAnchorDialogOpen(true)
+  }
 
-    console.log('Selected UTIDs:', selectedUtids)
-    console.log('Current orderRows:', orderRows)
+  async function submitAnchor() {
+    const date = anchorDate.trim()
+    if (!date) {
+      setError('Enter a ship date to anchor selected rows')
+      return
+    }
 
+    const selectedUtids = selectedAnchorUtids()
     if (selectedUtids.length === 0) {
       setError('No rows selected or no valid rows to anchor')
       return
     }
 
     try {
-      // Update the orderRows with the due_date for selected UTIDs
       const updatedOrderRows = orderRows.map((r) =>
-        selectedUtids.includes(r.utid.trim()) ? { ...r, due_date: date } : r,
+        selectedUtids.includes(r.utid.trim())
+          ? { ...r, due_date: date, anchor_factory_id: anchorFactoryId || undefined }
+          : r,
       )
-      console.log('Updated orderRows:', updatedOrderRows)
-
-      // Parse and save
       const parsed = parseOrderGridRows(updatedOrderRows)
-      console.log('Parsed orders to save:', parsed)
-
       const saved = await api.replaceOrders(scenarioId, parsed)
-      console.log('Saved orders:', saved)
-      console.log('Saved orders with due_date:', saved.filter(o => o.due_date))
 
       setOrders(saved)
-      const newOrderRows = orderRowsFromSaved(saved)
-      console.log('New orderRows after anchor:', newOrderRows)
-      setOrderRows(newOrderRows)
+      setOrderRows(orderRowsFromSaved(saved))
       setAnchorStatuses({})
-      setMessage(`Anchored ${selectedUtids.length} row${selectedUtids.length === 1 ? '' : 's'} to ${date}`)
+      const anchorFactory = factories.find((f) => f.id === anchorFactoryId)?.name
+      setMessage(`Anchored ${selectedUtids.length} row${selectedUtids.length === 1 ? '' : 's'} to ${date}${anchorFactory ? ` at ${anchorFactory}` : ''}`)
       setSelectedRows(new Set())
+      setAnchorDialogOpen(false)
     } catch (e: unknown) {
       setError(((e as { message?: string }).message) ?? 'failed to anchor rows')
     }
   }
 
   async function handleClearPlan() {
-    if (!confirm('Clear all plan rows? This cannot be undone.')) return
+    if (selectedRows.size === 0) {
+      setError('Select rows to clear')
+      return
+    }
+    const selectedCount = selectedRows.size
+    if (!confirm(`Clear ${selectedCount} selected row${selectedCount === 1 ? '' : 's'}? This cannot be undone.`)) return
     try {
       setError(null)
-      const saved = await api.replaceOrders(scenarioId, [])
+      const keptRows = orderRows.filter((_, i) => !selectedRows.has(i))
+      const saved = await api.replaceOrders(scenarioId, parseOrderGridRows(keptRows))
       setOrders(saved)
       setOrderRows(orderRowsFromSaved(saved))
       setAnchorStatuses({})
-      setMessage('Plan cleared')
+      setMessage(`Cleared ${selectedCount} selected row${selectedCount === 1 ? '' : 's'}`)
       setSelectedRows(new Set())
     } catch (e: unknown) {
-      setError(((e as { message?: string }).message) ?? 'failed to clear plan')
+      setError(((e as { message?: string }).message) ?? 'failed to clear selected rows')
     }
   }
 
@@ -580,6 +640,11 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
         scenarioId,
         'balance',
         maxStartsPerWeek > 0 ? maxStartsPerWeek : null,
+        factorySpacingLimits,
+        globalLeadTimePct,
+        factoryLeadTimeLimits,
+        globalLeadTimeDays,
+        factoryLeadTimeDayLimits,
       )
       const statusList = await api.listAnchorStatuses(scenarioId)
       setAnchorStatuses(Object.fromEntries(statusList.map((s) => [s.utid, s])))
@@ -595,6 +660,58 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
     <div className="space-y-4">
       {error && <div className="text-sm text-rose-600">{error}</div>}
       {message && <div className="text-sm text-emerald-700">{message}</div>}
+
+      {anchorDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-base font-semibold text-slate-900">Anchor selected rows</div>
+                <div className="text-xs text-slate-500">Set a ship date and optionally pin the work to one factory.</div>
+              </div>
+              <button className="text-slate-400 hover:text-slate-700" onClick={() => setAnchorDialogOpen(false)}>
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="mt-4 space-y-3">
+              <label className="block text-sm">
+                <span className="block text-xs font-medium uppercase tracking-wide text-slate-500 mb-1">Ship date</span>
+                <input
+                  type="date"
+                  value={anchorDate}
+                  onChange={(e) => setAnchorDate(e.target.value)}
+                  className="w-full rounded border border-slate-300 px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none"
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="block text-xs font-medium uppercase tracking-wide text-slate-500 mb-1">Factory</span>
+                <select
+                  value={anchorFactoryId}
+                  onChange={(e) => setAnchorFactoryId(e.target.value)}
+                  className="w-full rounded border border-slate-300 bg-white px-3 py-2 text-sm focus:border-indigo-400 focus:outline-none"
+                >
+                  <option value="">Any factory</option>
+                  {factories.map((f) => (
+                    <option key={f.id} value={f.id}>{f.name}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="text-xs text-slate-500">
+                Rows selected: {selectedAnchorUtids().length || orderRows.filter((r) => r.utid || r.customer).length}
+              </div>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button className="px-3 py-1.5 rounded border border-slate-300 text-sm text-slate-700 hover:bg-slate-50" onClick={() => setAnchorDialogOpen(false)}>
+                Cancel
+              </button>
+              <button className="inline-flex items-center gap-1 px-3 py-1.5 rounded bg-indigo-600 text-sm text-white hover:bg-indigo-700" onClick={submitAnchor}>
+                <Anchor className="w-4 h-4" />
+                Anchor
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
         <table className="min-w-full text-sm">
@@ -802,11 +919,11 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
           <div>
             <div className="text-xs font-medium uppercase tracking-wide text-slate-500">Plan</div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
             <button
               className="inline-flex items-center gap-1 px-3 py-1.5 border border-slate-300 bg-white text-slate-700 text-sm rounded hover:bg-slate-50"
-              onClick={handleAnchor}
-              title="Anchor selected rows to a ship date (auto-saves)"
+              onClick={openAnchorDialog}
+              title="Anchor selected rows to a ship date and optional factory (auto-saves)"
             >
               <Anchor className="w-4 h-4" />
               Anchor
@@ -814,7 +931,7 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
             <button
               className="inline-flex items-center gap-1 px-3 py-1.5 border border-rose-300 bg-white text-rose-700 text-sm rounded hover:bg-rose-50"
               onClick={handleClearPlan}
-              title="Clear all plan rows"
+              title="Clear selected plan rows"
             >
               <Trash2 className="w-4 h-4" />
               Clear
@@ -838,12 +955,143 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
               min={1}
               max={20}
             />
+            {factories.length > 0 && (
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Factory spacing overrides</div>
+                    <div className="text-[11px] text-slate-500">Blank uses the global switch value for that factory.</div>
+                  </div>
+                  {Object.keys(factorySpacingOverrides).length > 0 && (
+                    <button className="text-xs text-slate-500 hover:text-slate-800" onClick={() => setFactorySpacingOverrides({})}>
+                      Reset
+                    </button>
+                  )}
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                  {factories.map((f) => (
+                    <label key={f.id} className="flex items-center justify-between gap-2 rounded border border-slate-200 bg-white px-2 py-1.5">
+                      <span className="truncate text-xs font-medium text-slate-700" title={f.name}>{f.name}</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={20}
+                        placeholder={`${maxStartsPerWeek}/wk`}
+                        value={factorySpacingOverrides[f.id] ?? ''}
+                        onChange={(e) => setFactorySpacingOverrides((prev) => {
+                          const next = { ...prev }
+                          if (e.target.value) next[f.id] = e.target.value
+                          else delete next[f.id]
+                          return next
+                        })}
+                        className="w-20 rounded border border-slate-300 px-2 py-1 text-right text-xs focus:border-indigo-400 focus:outline-none"
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Lead-time adjustment</div>
+                  <div className="text-[11px] text-slate-500">Applied to cycle time as percent first, then fixed days. Positive adds time; negative reduces time.</div>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="flex items-center gap-2 text-xs text-slate-600">
+                    Global
+                    <input
+                      type="number"
+                      step={1}
+                      min={-95}
+                      max={500}
+                      value={leadTimePct}
+                      onChange={(e) => setLeadTimePct(e.target.value)}
+                      className="w-20 rounded border border-slate-300 px-2 py-1 text-right text-xs focus:border-indigo-400 focus:outline-none"
+                    />
+                    %
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-slate-600">
+                    plus
+                    <input
+                      type="number"
+                      step={1}
+                      min={-365}
+                      max={3650}
+                      value={leadTimeDays}
+                      onChange={(e) => setLeadTimeDays(e.target.value)}
+                      className="w-20 rounded border border-slate-300 px-2 py-1 text-right text-xs focus:border-indigo-400 focus:outline-none"
+                    />
+                    days
+                  </label>
+                </div>
+              </div>
+              {factories.length > 0 && (
+                <>
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <div className="text-[11px] text-slate-500">Optional per-factory overrides. Blank uses the global values.</div>
+                    {(Object.keys(factoryLeadTimeOverrides).length > 0 || Object.keys(factoryLeadTimeDayOverrides).length > 0) && (
+                      <button
+                        className="text-xs text-slate-500 hover:text-slate-800"
+                        onClick={() => {
+                          setFactoryLeadTimeOverrides({})
+                          setFactoryLeadTimeDayOverrides({})
+                        }}
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {factories.map((f) => (
+                      <label key={f.id} className="flex items-center justify-between gap-2 rounded border border-slate-200 bg-white px-2 py-1.5">
+                        <span className="truncate text-xs font-medium text-slate-700" title={f.name}>{f.name}</span>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number"
+                            step={1}
+                            min={-95}
+                            max={500}
+                            placeholder={`${globalLeadTimePct}%`}
+                            value={factoryLeadTimeOverrides[f.id] ?? ''}
+                            onChange={(e) => setFactoryLeadTimeOverrides((prev) => {
+                              const next = { ...prev }
+                              if (e.target.value) next[f.id] = e.target.value
+                              else delete next[f.id]
+                              return next
+                            })}
+                            className="w-16 rounded border border-slate-300 px-2 py-1 text-right text-xs focus:border-indigo-400 focus:outline-none"
+                          />
+                          <span className="text-[11px] text-slate-400">%</span>
+                          <input
+                            type="number"
+                            step={1}
+                            min={-365}
+                            max={3650}
+                            placeholder={`${globalLeadTimeDays}d`}
+                            value={factoryLeadTimeDayOverrides[f.id] ?? ''}
+                            onChange={(e) => setFactoryLeadTimeDayOverrides((prev) => {
+                              const next = { ...prev }
+                              if (e.target.value) next[f.id] = e.target.value
+                              else delete next[f.id]
+                              return next
+                            })}
+                            className="w-16 rounded border border-slate-300 px-2 py-1 text-right text-xs focus:border-indigo-400 focus:outline-none"
+                          />
+                          <span className="text-[11px] text-slate-400">d</span>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
           </div>
           <div>
             {capacitySummary ? (
               <span>
                 Capacity horizon: {capacitySummary.first} → {capacitySummary.last} ({capacitySummary.weekCount} weeks).{' '}
-                Plan rows: {capacitySummary.plannedRows}. Auto cadence: {capacitySummary.autoStarts}/week. Pull left to tighten the plan or right to spread it out.
+                Plan rows: {capacitySummary.plannedRows}. Auto cadence: {capacitySummary.autoStarts}/week. The switch applies to every factory by default; use overrides for distinct factory spacing and lead-time adjustments.
               </span>
             ) : (
               <span>Save weekly factory bays to define the capacity horizon.</span>
@@ -898,7 +1146,8 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
                     <div className="flex items-center gap-1">
                       {row.utid && row.due_date && (() => {
                         const status = getAnchorStatus(row.utid, row.due_date)
-                        const tooltip = `Target due: ${status.targetDueDate}${status.requiredStart ? `\nRequired start: ${status.requiredStart}` : ''}${status.actualFinish ? `\nScheduled finish: ${status.actualFinish}` : ''}${status.isLate ? '\nMISSED DUE DATE' : ''}`
+                        const anchorFactory = factories.find((f) => f.id === row.anchor_factory_id)?.name
+                        const tooltip = `Target due: ${status.targetDueDate}${anchorFactory ? `\nFactory: ${anchorFactory}` : ''}${status.requiredStart ? `\nRequired start: ${status.requiredStart}` : ''}${status.actualFinish ? `\nScheduled finish: ${status.actualFinish}` : ''}${status.isLate ? '\nMISSED DUE DATE' : ''}`
                         return (
                           <div
                             className={`group relative flex-shrink-0 flex items-center gap-1 rounded px-0.5 ${status.isLate ? 'bg-red-100 ring-1 ring-red-300' : ''}`}
@@ -929,6 +1178,7 @@ export function FactoryEditor({ scenarioId, onResult }: Props) {
                             </button>
                             <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-2 py-1 bg-slate-900 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50">
                               <div>Target due: {status.targetDueDate}</div>
+                              {anchorFactory && <div>Factory: {anchorFactory}</div>}
                               {status.requiredStart && <div>Required start: {status.requiredStart}</div>}
                               {status.actualFinish && <div>Scheduled finish: {status.actualFinish}</div>}
                               {status.isLate && <div className="text-red-300 font-semibold">MISSED DUE DATE</div>}

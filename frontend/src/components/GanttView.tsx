@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react'
-import { Copy, Check } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Copy, Check, ChevronDown } from 'lucide-react'
 import PlotComponent from 'react-plotly.js'
-import type { Factory, Product, RunResult, ScheduledUnit } from '../types'
+import * as api from '../api'
+import type { Factory, Product, RunResult, ScheduleRun, ScheduledUnit } from '../types'
 
 const Plot = ((PlotComponent as unknown as { default?: typeof PlotComponent }).default ?? PlotComponent) as typeof PlotComponent
 
@@ -10,6 +11,8 @@ interface Props {
   factories: Factory[]
   products: Product[]
 }
+
+type UtidSort = 'ship' | 'start'
 
 const DAY = 86400000
 
@@ -85,6 +88,18 @@ function quarterLabel(ms: number): string {
   return `Q${q} '${yy}`
 }
 
+function quarterMarkers(startMs: number, endMs: number): number[] {
+  const markers: number[] = []
+  for (let q = quarterStartMs(startMs); q <= endMs; q = nextQuarterStartMs(q)) markers.push(q)
+  return markers
+}
+
+function runOptionLabel(run: ScheduleRun): string {
+  const d = new Date(run.run_at)
+  const when = Number.isNaN(d.getTime()) ? run.run_at : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+  return `${when} — ${run.shipped_on_time} scheduled, ${run.unshippable} unscheduled`
+}
+
 /**
  * Compact bar label: quarter + 2-digit year (from the due date) + first 2
  * letters of the product name. e.g. due 2026-08-15, "Widget" -> "Q3'26 Wi".
@@ -120,14 +135,26 @@ interface FactoryStat {
 export function GanttView({ result, factories, products }: Props) {
   const multi = factories.length > 1
   const [view, setView] = useState<string>(() => (multi ? 'all' : factories[0]?.id ?? ''))
-  const [showIdle, setShowIdle] = useState(false)
-  const [scenario, setScenario] = useState('current')
+  const showIdle = false
+  const [runSelection, setRunSelection] = useState('current')
+  const [savedRuns, setSavedRuns] = useState<ScheduleRun[]>([])
+  const [selectedRunResult, setSelectedRunResult] = useState<RunResult | null>(null)
+  const [runHistoryError, setRunHistoryError] = useState<string | null>(null)
   const [chartMode, setChartMode] = useState<'merged' | 'split'>('merged')
   const [wideCharts, setWideCharts] = useState(true)
+  const [chartRevision, setChartRevision] = useState(0)
+  const [utidSort, setUtidSort] = useState<UtidSort>('ship')
+  const [factoryGanttOpen, setFactoryGanttOpen] = useState(false)
   const [copied, setCopied] = useState(false)
-  const alternatives = result.alternatives ?? []
-  const selectedAlt = alternatives.find((a) => a.kind === scenario)
-  const activeUnits = selectedAlt?.units ?? result.units
+  const [utidPlotMargins, setUtidPlotMargins] = useState({ left: 140, right: 20 })
+  const utidTopScrollRef = useRef<HTMLDivElement>(null)
+  const utidBodyScrollRef = useRef<HTMLDivElement>(null)
+  const displayedResult = selectedRunResult ?? result
+  const alternatives = displayedResult.alternatives ?? []
+  const selectedAlt = runSelection.startsWith('alt:')
+    ? alternatives.find((a) => a.kind === runSelection.slice(4))
+    : undefined
+  const activeUnits = selectedAlt?.units ?? displayedResult.units
 
   const productNames = useMemo(() => {
     const m = new Map<string, string>()
@@ -141,12 +168,73 @@ export function GanttView({ result, factories, products }: Props) {
     return m
   }, [factories])
 
-  const utidChart = useMemo(() => {
-    const units = activeUnits
+  const visibleShippedUnits = useMemo(
+    () => activeUnits
       .filter((u) => u.status === 'shipped' && u.factory_id != null)
+      .filter((u) => view === 'all' || u.factory_id === view),
+    [activeUnits, view],
+  )
+
+  const timelineFrame = useMemo(() => {
+    if (visibleShippedUnits.length === 0) {
+      return {
+        rangeStart: Date.UTC(2026, 0, 1),
+        rangeEnd: Date.UTC(2026, 3, 1),
+        quarters: [Date.UTC(2026, 0, 1), Date.UTC(2026, 3, 1)],
+        width: 1800,
+      }
+    }
+    const rangeStart = quarterStartMs(Math.min(...visibleShippedUnits.map((u) => parseMs(u.required_start))))
+    const rangeEnd = nextQuarterStartMs(Math.max(...visibleShippedUnits.map((u) => parseMs(u.due_date))))
+    const quarters = quarterMarkers(rangeStart, rangeEnd)
+    const utidWidth = Math.max(1000, visibleShippedUnits.length * 18, quarters.length * 180)
+    return {
+      rangeStart,
+      rangeEnd,
+      quarters,
+      width: utidWidth,
+    }
+  }, [visibleShippedUnits])
+
+  useEffect(() => {
+    setRunSelection('current')
+    setSelectedRunResult(null)
+    setRunHistoryError(null)
+    void (async () => {
+      try {
+        const runs = await api.listScenarioRuns(result.run.scenario_id)
+        setSavedRuns(runs.filter((run) => run.id !== result.run.id))
+      } catch (e: unknown) {
+        setRunHistoryError(((e as { message?: string }).message) ?? 'failed to load saved runs')
+      }
+    })()
+  }, [result.run.id, result.run.scenario_id])
+
+  async function handleRunSelection(value: string) {
+    setRunSelection(value)
+    setRunHistoryError(null)
+    if (value === 'current' || value.startsWith('alt:')) {
+      setSelectedRunResult(null)
+      return
+    }
+    if (value.startsWith('run:')) {
+      try {
+        setSelectedRunResult(await api.getRun(value.slice(4)))
+      } catch (e: unknown) {
+        setRunHistoryError(((e as { message?: string }).message) ?? 'failed to load saved run')
+      }
+    }
+  }
+
+  const utidChart = useMemo(() => {
+    const units = visibleShippedUnits
       .slice()
-      .filter((u) => view === 'all' || u.factory_id === view)
-      .sort((a, b) => a.required_start.localeCompare(b.required_start) || (a.serial ?? '').localeCompare(b.serial ?? ''))
+      .sort((a, b) => {
+        const primary = utidSort === 'ship'
+          ? a.due_date.localeCompare(b.due_date)
+          : a.required_start.localeCompare(b.required_start)
+        return primary || a.required_start.localeCompare(b.required_start) || a.due_date.localeCompare(b.due_date) || (a.serial ?? '').localeCompare(b.serial ?? '')
+      })
     const labels = units.map((u) => {
       const baseLabel = u.serial || 'Unknown'
       return u.is_anchored ? `⚓ ${baseLabel}` : baseLabel
@@ -170,6 +258,18 @@ export function GanttView({ result, factories, products }: Props) {
       colors.push(isLateAnchored(u) ? LATE_ANCHOR_COLOR : factoryColor(factories, u.factory_id))
       hover.push(`${label}<br>${fn} · Bay ${(u.bay_index ?? 0) + 1}<br>${u.required_start} → ${u.due_date} (${Math.round((e - s) / DAY)}d)${anchorHoverDetails(u)}`)
     }
+    const { rangeStart, rangeEnd, quarters } = timelineFrame
+    const quarterShapes = quarters.map((q) => ({
+      type: 'line',
+      xref: 'x',
+      yref: 'paper',
+      x0: q,
+      x1: q,
+      y0: 0,
+      y1: 1,
+      line: { color: '#94a3b8', width: 1, dash: 'dot' },
+      layer: 'above',
+    })) as Partial<Plotly.Shape>[]
     return {
       data: [
         {
@@ -193,28 +293,43 @@ export function GanttView({ result, factories, products }: Props) {
         autosize: true,
         barmode: 'overlay',
         bargap: 0.25,
-        dragmode: 'pan',
-        xaxis: { type: 'date', title: { text: 'Date' }, tickformat: '%b %d', showgrid: true },
+        shapes: quarterShapes,
+        xaxis: {
+          type: 'date',
+          title: { text: '' },
+          range: [rangeStart, rangeEnd],
+          side: 'top',
+          dtick: 'M3',
+          tickformat: "%b '%y",
+          showgrid: true,
+          gridcolor: '#e2e8f0',
+          griddash: 'dot',
+          showticklabels: false,
+          ticks: '',
+          fixedrange: true,
+        },
         yaxis: {
           title: { text: 'UTID' },
           type: 'category',
           categoryorder: 'array',
           categoryarray: labels,
           autorange: 'reversed',
-          automargin: true,
+          automargin: false,
+          fixedrange: true,
         },
-        margin: { l: 20, r: 20, t: 20, b: 50 },
-        height: Math.max(260, labels.length * 24 + 120),
+        margin: { l: 140, r: 20, t: 36, b: 20 },
+        height: Math.max(260, labels.length * 24 + 95),
       } as Partial<Plotly.Layout>,
-      width: Math.max(1000, units.length * 18),
+      width: Math.max(timelineFrame.width, units.length * 18),
+      rangeStart,
+      rangeEnd,
+      quarters,
     }
-  }, [activeUnits, factories, factoryNames, view])
+  }, [visibleShippedUnits, utidSort, factoryNames, factories, timelineFrame])
 
   const concurrentCountChart = useMemo(() => {
-    const units = activeUnits
-      .filter((u) => u.status === 'shipped' && u.factory_id != null)
+    const units = visibleShippedUnits
       .slice()
-      .filter((u) => view === 'all' || u.factory_id === view)
       .sort((a, b) => a.required_start.localeCompare(b.required_start))
     if (units.length === 0) return null
 
@@ -238,9 +353,8 @@ export function GanttView({ result, factories, products }: Props) {
 
     if (allDatesSet.size === 0) return null
 
-    const allDates = Array.from(allDatesSet).sort()
-    const minDate = allDates[0]
-    const rangeMaxDate = allDates[allDates.length - 1]
+    const minDate = fmtMs(timelineFrame.rangeStart)
+    const rangeMaxDate = fmtMs(timelineFrame.rangeEnd - DAY)
 
     const dateList: string[] = []
     let currentDate = new Date(minDate)
@@ -298,7 +412,7 @@ export function GanttView({ result, factories, products }: Props) {
         name: factoryNames.get(fid) ?? fid,
         x: dateList,
         y: counts,
-        marker: { color: factoryColor(factories, fid), opacity: 0.3 },
+        marker: { color: factoryColor(factories, fid), opacity: 0.78, line: { color: 'rgba(255,255,255,0.8)', width: 0.5 } },
         hovertemplate: `${factoryNames.get(fid) ?? fid}<br>%{x}<br>Bays: %{y}<extra></extra>`,
         hoverinfo: 'text',
         showlegend: true,
@@ -306,6 +420,15 @@ export function GanttView({ result, factories, products }: Props) {
     }
 
     const totalCounts = dateList.map((_, i) => factoryCounts.reduce((sum, counts) => sum + counts[i], 0))
+    const dailyTotals = dateList.map((date, i) => ({
+      date,
+      total: totalCounts[i],
+      factories: factoryIds.map((factoryId, factoryIndex) => ({
+        factoryId,
+        factoryName: factoryNames.get(factoryId) ?? factoryId,
+        count: factoryCounts[factoryIndex][i],
+      })),
+    }))
     const maxCount = Math.max(...totalCounts, 0)
     const maxIndex = totalCounts.indexOf(maxCount)
     const maxDate = maxIndex >= 0 ? dateList[maxIndex] : null
@@ -324,14 +447,27 @@ export function GanttView({ result, factories, products }: Props) {
       maxBreakdown.sort((a, b) => b.count - a.count)
     }
 
-    const xMs = dateList.map(parseMs)
-    const minX = Math.min(...xMs)
-    const maxX = Math.max(...xMs)
+    const minX = timelineFrame.rangeStart
+    const maxX = timelineFrame.rangeEnd
+    const width = timelineFrame.width
+    const quarterShapes = timelineFrame.quarters.map((q) => ({
+      type: 'line',
+      xref: 'x',
+      yref: 'paper',
+      x0: q,
+      x1: q,
+      y0: 0,
+      y1: 1,
+      line: { color: '#94a3b8', width: 1, dash: 'dot' },
+      layer: 'above',
+    })) as Partial<Plotly.Shape>[]
 
     return {
       maxCount,
       maxDate,
       maxBreakdown,
+      dailyTotals,
+      width,
       data: traces,
       layout: {
         autosize: true,
@@ -344,22 +480,25 @@ export function GanttView({ result, factories, products }: Props) {
         margin: { l: 60, r: 20, t: 10, b: 40 },
         height: 120,
         legend: { orientation: 'h', y: -0.2, x: 0.5, xanchor: 'center' },
-        shapes: maxCount > 0
-          ? [
-              {
-                type: 'line',
-                x0: minDate,
-                x1: rangeMaxDate,
-                y0: maxCount,
-                y1: maxCount,
-                line: {
-                  color: '#ef4444',
-                  width: 2,
-                  dash: 'dot',
-                },
-              } as Plotly.Shape,
-            ]
-          : [],
+        shapes: [
+          ...quarterShapes,
+          ...(maxCount > 0
+            ? [
+                {
+                  type: 'line',
+                  x0: minDate,
+                  x1: rangeMaxDate,
+                  y0: maxCount,
+                  y1: maxCount,
+                  line: {
+                    color: '#ef4444',
+                    width: 2,
+                    dash: 'dot',
+                  },
+                } as Plotly.Shape,
+              ]
+            : []),
+        ],
         annotations: maxCount > 0
           ? [
               {
@@ -383,7 +522,7 @@ export function GanttView({ result, factories, products }: Props) {
           : [],
       } as Partial<Plotly.Layout>,
     }
-  }, [activeUnits, factories, factoryNames, view])
+  }, [visibleShippedUnits, factories, factoryNames, timelineFrame])
 
   const { charts, stats } = useMemo(() => {
     const shipped = activeUnits.filter((u) => u.status === 'shipped' && u.factory_id != null)
@@ -670,10 +809,12 @@ export function GanttView({ result, factories, products }: Props) {
         annotations: quarterAnnotations,
         xaxis: {
           type: 'date',
-          title: { text: 'Date' },
+          title: { text: '' },
+          side: 'top',
           showgrid: false,
           dtick: 'M3',
           tickformat: "%b '%y",
+          range: [timelineFrame.rangeStart, timelineFrame.rangeEnd],
         },
         yaxis: {
           title: { text: merged ? 'Factory · Bay' : 'Bays' },
@@ -683,8 +824,8 @@ export function GanttView({ result, factories, products }: Props) {
           autorange: 'reversed',
           automargin: true,
         },
-        margin: { l: 20, r: 20, t: 28, b: 50 },
-        legend: { orientation: 'h', y: -0.18 },
+        margin: { l: 20, r: 20, t: 50, b: 28 },
+        legend: { orientation: 'h', y: -0.16 },
         height: Math.max(220, rowLabels.length * 30 + 145),
       }
 
@@ -694,13 +835,13 @@ export function GanttView({ result, factories, products }: Props) {
         data: traces,
         layout,
         stats,
-        width: Math.max(1000, bucketCount * 180),
+        width: Math.max(timelineFrame.width, bucketCount * 180),
       }
     }
 
     const charts = chartFactoryGroups.map((group, i) => buildChart(group, i))
     return { charts, stats: charts.flatMap((chart) => chart.stats) }
-  }, [view, chartMode, showIdle, factories, productNames, activeUnits])
+  }, [view, chartMode, showIdle, factories, productNames, activeUnits, timelineFrame])
 
   const shipmentsByQuarter = useMemo(() => {
     const shipped = activeUnits.filter((u) => u.status === 'shipped' && u.factory_id != null)
@@ -730,6 +871,31 @@ export function GanttView({ result, factories, products }: Props) {
     await navigator.clipboard.writeText(tsv)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
+  }
+
+  function setChartWidthMode(wide: boolean) {
+    setWideCharts(wide)
+    setChartRevision((v) => v + 1)
+  }
+
+  function syncUtidScroll(source: 'top' | 'body') {
+    const top = utidTopScrollRef.current
+    const body = utidBodyScrollRef.current
+    if (!top || !body) return
+    if (source === 'top') body.scrollLeft = top.scrollLeft
+    else top.scrollLeft = body.scrollLeft
+  }
+
+  function captureUtidPlotMargins(_figure: unknown, graphDiv: unknown) {
+    const size = (graphDiv as { _fullLayout?: { _size?: { l?: number; r?: number } } })?._fullLayout?._size
+    const left = size?.l
+    const right = size?.r
+    if (typeof left !== 'number' || typeof right !== 'number') return
+    setUtidPlotMargins((prev) => (
+      Math.abs(prev.left - left) < 1 && Math.abs(prev.right - right) < 1
+        ? prev
+        : { left, right }
+    ))
   }
 
   if (factories.length === 0) {
@@ -784,15 +950,22 @@ export function GanttView({ result, factories, products }: Props) {
       </div>
       <div className="flex flex-wrap items-center gap-4 text-sm">
         <div className="flex items-center gap-2">
-          <span className="text-slate-600">Scenario:</span>
+          <span className="text-slate-600">Run:</span>
           <select
-            className="border border-slate-300 rounded px-2 py-1 bg-white"
-            value={scenario}
-            onChange={(e) => setScenario(e.target.value)}
+            className="border border-slate-300 rounded px-2 py-1 bg-white max-w-md"
+            value={runSelection}
+            onChange={(e) => void handleRunSelection(e.target.value)}
           >
             <option value="current">Current run</option>
+            {savedRuns.length > 0 && <option disabled>Previous runs</option>}
+            {savedRuns.map((run) => (
+              <option key={run.id} value={`run:${run.id}`}>
+                {runOptionLabel(run)}
+              </option>
+            ))}
+            {alternatives.length > 0 && <option disabled>What-if alternatives</option>}
             {alternatives.map((a) => (
-              <option key={a.kind} value={a.kind}>
+              <option key={a.kind} value={`alt:${a.kind}`}>
                 {a.label}
               </option>
             ))}
@@ -803,6 +976,7 @@ export function GanttView({ result, factories, products }: Props) {
               on time
             </span>
           )}
+          {runHistoryError && <span className="text-xs text-rose-600">{runHistoryError}</span>}
         </div>
         <div className="flex items-center gap-2">
           <span className="text-slate-600">View:</span>
@@ -840,25 +1014,24 @@ export function GanttView({ result, factories, products }: Props) {
             </div>
           </div>
         )}
-        <button
-          type="button"
-          className="px-2.5 py-1 border border-slate-300 rounded text-sm text-slate-700 bg-white hover:bg-slate-50"
-          onClick={() => setWideCharts((v) => !v)}
-        >
-          {wideCharts ? 'Compact' : 'Wide'}
-        </button>
-        <label className="flex items-center gap-2 text-slate-600 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={showIdle}
-            onChange={(e) => setShowIdle(e.target.checked)}
-          />
-          Highlight idle / open
-        </label>
+        <div className="inline-flex rounded-md border border-slate-300 overflow-hidden text-sm">
+          <button
+            type="button"
+            className={`px-2.5 py-1 ${wideCharts ? 'bg-slate-700 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+            onClick={() => setChartWidthMode(true)}
+          >
+            Wide
+          </button>
+          <button
+            type="button"
+            className={`px-2.5 py-1 border-l border-slate-300 ${!wideCharts ? 'bg-slate-700 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+            onClick={() => setChartWidthMode(false)}
+          >
+            Compact
+          </button>
+        </div>
         <span className="text-xs text-slate-500">
-          UTID timeline colors are by factory; factory/bay Gantt colors are by shipping quarter. Gaps <em>between</em> products are <strong>idle</strong>;{' '}
-          <strong className="text-green-600">green</strong> = open: after a bay&apos;s last unit
-          ships (and entirely empty bays). Time before the first unit is ignored.
+          UTID timeline colors are by factory; factory/bay Gantt colors are by shipping quarter.
         </span>
       </div>
 
@@ -923,65 +1096,145 @@ export function GanttView({ result, factories, products }: Props) {
         </div>
       )}
 
-      {concurrentCountChart && (
-        <div className={`${wideCharts ? 'relative left-1/2 -translate-x-1/2 w-[calc(100vw-3rem)]' : 'w-full'} rounded-lg border border-slate-200 bg-white p-3`}>
-          <div className="flex items-center justify-between mb-1">
-            <h4 className="text-sm font-semibold text-slate-700">Bays per day</h4>
-            <span className="text-xs text-slate-500">X-axis = Date · Stacked by factory</span>
-          </div>
-          <div className={wideCharts ? 'w-full overflow-x-auto pb-2' : 'w-full'}>
-            <Plot
-              key={`concurrent-${wideCharts ? 'wide' : 'compact'}`}
-              data={concurrentCountChart.data}
-              layout={concurrentCountChart.layout}
-              config={{ displayModeBar: false, displaylogo: false, responsive: true }}
-              style={{ width: wideCharts ? `max(100%, ${concurrentCountChart.layout.width || 1000}px)` : '100%' }}
-              useResizeHandler
-            />
-          </div>
-        </div>
-      )}
-
       <div className={`${wideCharts ? 'relative left-1/2 -translate-x-1/2 w-[calc(100vw-3rem)]' : 'w-full'} rounded-lg border border-slate-200 bg-white p-3`}>
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
           <h4 className="text-sm font-semibold text-slate-700">UTID timeline</h4>
-          <span className="text-xs text-slate-500">Y-axis = UTID, X-axis = date</span>
+          <div className="flex items-center gap-3">
+            <div className="inline-flex rounded-md border border-slate-300 overflow-hidden text-xs">
+              <button
+                type="button"
+                className={`px-2.5 py-1 ${utidSort === 'ship' ? 'bg-slate-700 text-white' : 'bg-white text-slate-600'}`}
+                onClick={() => setUtidSort('ship')}
+              >
+                Sort by ship
+              </button>
+              <button
+                type="button"
+                className={`px-2.5 py-1 border-l border-slate-300 ${utidSort === 'start' ? 'bg-slate-700 text-white' : 'bg-white text-slate-600'}`}
+                onClick={() => setUtidSort('start')}
+              >
+                Sort by start
+              </button>
+            </div>
+            <span className="text-xs text-slate-500">Y-axis = UTID, X-axis = date</span>
+          </div>
         </div>
-        <div className={wideCharts ? 'w-full overflow-x-auto pb-2' : 'w-full'}>
-          <Plot
-            key={`utid-${wideCharts ? 'wide' : 'compact'}`}
-            data={utidChart.data}
-            layout={utidChart.layout}
-            config={{ displayModeBar: false, displaylogo: false, responsive: true }}
-            style={{ width: wideCharts ? `max(100%, ${utidChart.width}px)` : '100%' }}
-            useResizeHandler
-          />
-        </div>
-      </div>
-
-      <div className={`${wideCharts ? 'relative left-1/2 -translate-x-1/2 w-[calc(100vw-3rem)]' : 'w-full'} space-y-3`}>
-        {charts.map((chart) => (
-          <div key={chart.key} className="rounded-lg border border-slate-200 bg-white p-3">
-            {charts.length > 1 && (
-              <div className="flex items-center justify-between mb-2">
-                <h4 className="text-sm font-semibold text-slate-700">{chart.title}</h4>
-                <span className="text-xs text-slate-500">
-                  {wideCharts ? 'Scroll horizontally for longer timelines' : 'Compact width'}
-                </span>
+        {wideCharts && (
+          <div
+            ref={utidTopScrollRef}
+            className="w-full overflow-x-auto pb-1 mb-2"
+            onScroll={() => syncUtidScroll('top')}
+          >
+            <div style={{ width: `${utidChart.width}px`, height: 1 }} />
+          </div>
+        )}
+        <div
+          ref={utidBodyScrollRef}
+          className={wideCharts ? 'w-full overflow-x-auto scrollbar-hidden' : 'w-full'}
+          onScroll={() => syncUtidScroll('body')}
+        >
+          <div style={{ width: wideCharts ? `${utidChart.width}px` : '100%' }}>
+            <div className="max-h-[70vh] overflow-y-auto overflow-x-hidden rounded border border-slate-100">
+              <div className="sticky top-0 z-20 h-40 bg-white/95 backdrop-blur border-b border-slate-200">
+                {concurrentCountChart ? (
+                  <Plot
+                    key={`concurrent-header-${wideCharts ? 'wide' : 'compact'}-${chartRevision}`}
+                    data={concurrentCountChart.data}
+                    layout={{
+                      ...concurrentCountChart.layout,
+                      autosize: !wideCharts,
+                      width: wideCharts ? utidChart.width : undefined,
+                      height: 154,
+                      dragmode: false,
+                      xaxis: {
+                        ...(concurrentCountChart.layout.xaxis as Partial<Plotly.LayoutAxis>),
+                        range: [utidChart.rangeStart, utidChart.rangeEnd],
+                        side: 'bottom',
+                        dtick: 'M3',
+                        tickformat: "%b '%y",
+                        fixedrange: true,
+                      },
+                      yaxis: {
+                        ...(concurrentCountChart.layout.yaxis as Partial<Plotly.LayoutAxis>),
+                        title: { text: 'Bays / day' },
+                        fixedrange: true,
+                      },
+                      margin: { l: utidPlotMargins.left, r: utidPlotMargins.right, t: 8, b: 34 },
+                      legend: { orientation: 'h', y: 1.08, x: 1, xanchor: 'right', font: { size: 10 } },
+                    }}
+                    config={{ displayModeBar: false, displaylogo: false, responsive: !wideCharts }}
+                    style={{ width: wideCharts ? `${utidChart.width}px` : '100%', height: 154 }}
+                    useResizeHandler={!wideCharts}
+                  />
+                ) : (
+                  <div className="h-full flex items-center px-4 text-xs text-slate-500">No bays per day data</div>
+                )}
               </div>
-            )}
-            <div className={wideCharts ? 'w-full overflow-x-auto pb-2' : 'w-full'}>
               <Plot
-                key={`${chart.key}-${wideCharts ? 'wide' : 'compact'}`}
-                data={chart.data}
-                layout={chart.layout}
-                config={{ displayModeBar: false, displaylogo: false, responsive: true }}
-                style={{ width: wideCharts ? `max(100%, ${chart.width}px)` : '100%' }}
-                useResizeHandler
+                key={`utid-${wideCharts ? 'wide' : 'compact'}-${utidSort}-${chartRevision}`}
+                data={utidChart.data}
+                layout={{
+                  ...utidChart.layout,
+                  autosize: !wideCharts,
+                  width: wideCharts ? utidChart.width : undefined,
+                }}
+                config={{ displayModeBar: false, displaylogo: false, responsive: !wideCharts }}
+                style={{ width: wideCharts ? `${utidChart.width}px` : '100%' }}
+                useResizeHandler={!wideCharts}
+                onInitialized={captureUtidPlotMargins}
+                onUpdate={captureUtidPlotMargins}
               />
             </div>
           </div>
-        ))}
+        </div>
+      </div>
+
+      <div className={`${wideCharts ? 'relative left-1/2 -translate-x-1/2 w-[calc(100vw-3rem)]' : 'w-full'} rounded-lg border border-slate-200 bg-white`}>
+        <button
+          type="button"
+          className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left hover:bg-slate-50"
+          onClick={() => setFactoryGanttOpen((v) => !v)}
+        >
+          <div>
+            <h4 className="text-sm font-semibold text-slate-700">Factory / bay Gantt</h4>
+            <div className="text-xs text-slate-500">
+              Detailed bay-level schedule is collapsed by default.
+            </div>
+          </div>
+          <ChevronDown className={`w-4 h-4 text-slate-500 transition-transform duration-300 ${factoryGanttOpen ? 'rotate-180' : ''}`} />
+        </button>
+        <div className={`grid transition-[grid-template-rows,opacity] duration-300 ease-out ${factoryGanttOpen ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'}`}>
+          <div className="overflow-hidden">
+            <div className="space-y-3 border-t border-slate-100 p-3">
+              {charts.map((chart) => (
+                <div key={chart.key} className="rounded-lg border border-slate-200 bg-white p-3">
+                  {charts.length > 1 && (
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="text-sm font-semibold text-slate-700">{chart.title}</h4>
+                      <span className="text-xs text-slate-500">
+                        {wideCharts ? 'Scroll horizontally for longer timelines' : 'Compact width'}
+                      </span>
+                    </div>
+                  )}
+                  <div className={wideCharts ? 'w-full overflow-x-auto pb-2' : 'w-full'}>
+                    <Plot
+                      key={`${chart.key}-${wideCharts ? 'wide' : 'compact'}-${factoryGanttOpen ? 'open' : 'closed'}-${chartRevision}`}
+                      data={chart.data}
+                      layout={{
+                        ...chart.layout,
+                        autosize: !wideCharts,
+                        width: wideCharts ? chart.width : undefined,
+                      }}
+                      config={{ displayModeBar: false, displaylogo: false, responsive: !wideCharts }}
+                      style={{ width: wideCharts ? `${chart.width}px` : '100%' }}
+                      useResizeHandler={!wideCharts}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   )

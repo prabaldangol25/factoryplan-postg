@@ -75,6 +75,7 @@ export interface ScenarioOrder {
   cycle_time_days: number
   sort_order: number
   due_date?: string
+  anchor_factory_id?: string
 }
 
 export type PeriodType = 'month' | 'quarter'

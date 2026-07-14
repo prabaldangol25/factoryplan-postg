@@ -176,13 +176,17 @@ async fn create_scenario(
         }
 
         let orders = sqlx::query_as::<_, ScenarioOrder>(
-            "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order FROM scenario_order WHERE scenario_id = $1",
+            "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date, anchor_factory_id FROM scenario_order WHERE scenario_id = $1",
         )
         .bind(src_id)
         .fetch_all(&mut *tx)
         .await?;
         for o in orders {
-            sqlx::query("INSERT INTO scenario_order (id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+            let anchor_factory_id = o
+                .anchor_factory_id
+                .as_ref()
+                .and_then(|fid| factory_id_map.get(fid));
+            sqlx::query("INSERT INTO scenario_order (id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date, anchor_factory_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
                 .bind(new_id())
                 .bind(&id)
                 .bind(&o.utid)
@@ -190,6 +194,8 @@ async fn create_scenario(
                 .bind(&o.customer)
                 .bind(o.cycle_time_days)
                 .bind(o.sort_order)
+                .bind(&o.due_date)
+                .bind(anchor_factory_id)
                 .execute(&mut *tx)
                 .await?;
         }

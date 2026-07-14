@@ -3,7 +3,6 @@ import {
   Factory as FactoryIcon,
   Building2,
   BarChart3,
-  Download,
   Table2,
 } from 'lucide-react'
 import * as api from './api'
@@ -275,22 +274,6 @@ function ResultsTab({ result, context, onGoToRun }: ResultsTabProps) {
   }
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-end gap-2">
-        <a
-          href={api.exportRunCsvUrl(result.run.id)}
-          className="inline-flex items-center gap-1 px-3 py-1.5 border border-slate-300 bg-white text-slate-700 text-sm rounded hover:bg-slate-50"
-        >
-          <Download className="w-4 h-4" />
-          CSV
-        </a>
-        <a
-          href={api.exportRunXlsxUrl(result.run.id)}
-          className="inline-flex items-center gap-1 px-3 py-1.5 border border-slate-300 bg-white text-slate-700 text-sm rounded hover:bg-slate-50"
-        >
-          <Download className="w-4 h-4" />
-          XLSX
-        </a>
-      </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
         <div className="rounded-lg border border-slate-200 bg-white p-3">
           <div className="text-slate-500">UTID orders</div>

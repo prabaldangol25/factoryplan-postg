@@ -25,7 +25,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 async fn list_orders(pool: web::Data<Pool>, path: web::Path<String>) -> AppResult<HttpResponse> {
     let scenario_id = path.into_inner();
     let rows = sqlx::query_as::<_, ScenarioOrder>(
-        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
+        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date, anchor_factory_id FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
     )
     .bind(&scenario_id)
     .fetch_all(pool.get_ref())
@@ -98,7 +98,7 @@ async fn replace_orders(
         .execute(&mut *tx)
         .await?;
     for (o, sort_order) in cleaned {
-        sqlx::query("INSERT INTO scenario_order (id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
+        sqlx::query("INSERT INTO scenario_order (id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date, anchor_factory_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
             .bind(new_id())
             .bind(&scenario_id)
             .bind(o.utid.trim())
@@ -107,13 +107,14 @@ async fn replace_orders(
             .bind(o.cycle_time_days)
             .bind(sort_order)
             .bind(&o.due_date)
+            .bind(o.anchor_factory_id.as_ref().filter(|id| !id.trim().is_empty()))
             .execute(&mut *tx)
             .await?;
     }
     tx.commit().await?;
 
     let rows = sqlx::query_as::<_, ScenarioOrder>(
-        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
+        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date, anchor_factory_id FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
     )
     .bind(&scenario_id)
     .fetch_all(pool.get_ref())
@@ -128,14 +129,14 @@ async fn remove_anchor(
 ) -> AppResult<HttpResponse> {
     let (scenario_id, utid) = path.into_inner();
 
-    sqlx::query("UPDATE scenario_order SET due_date = NULL WHERE scenario_id = $1 AND utid = $2")
+    sqlx::query("UPDATE scenario_order SET due_date = NULL, anchor_factory_id = NULL WHERE scenario_id = $1 AND utid = $2")
         .bind(&scenario_id)
         .bind(&utid)
         .execute(pool.get_ref())
         .await?;
 
     let rows = sqlx::query_as::<_, ScenarioOrder>(
-        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
+        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date, anchor_factory_id FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
     )
     .bind(&scenario_id)
     .fetch_all(pool.get_ref())

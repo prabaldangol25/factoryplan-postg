@@ -21,6 +21,16 @@ struct RunQuery {
     optimize: Option<String>,
     #[serde(default)]
     max_starts_per_week: Option<i64>,
+    #[serde(default)]
+    factory_starts_per_week: Option<String>,
+    #[serde(default)]
+    lead_time_pct: Option<f64>,
+    #[serde(default)]
+    factory_lead_time_pct: Option<String>,
+    #[serde(default)]
+    lead_time_days: Option<i64>,
+    #[serde(default)]
+    factory_lead_time_days: Option<String>,
 }
 
 impl RunQuery {
@@ -30,6 +40,93 @@ impl RunQuery {
             _ => BayAssignment::BalanceLoad,
         }
     }
+
+    fn factory_start_limits(&self) -> HashMap<String, i64> {
+        parse_factory_start_limits(self.factory_starts_per_week.as_deref())
+    }
+
+    fn factory_lead_time_limits(&self) -> HashMap<String, f64> {
+        parse_factory_percent_limits(self.factory_lead_time_pct.as_deref())
+    }
+
+    fn factory_lead_time_day_limits(&self) -> HashMap<String, i64> {
+        parse_factory_day_limits(self.factory_lead_time_days.as_deref())
+    }
+}
+
+fn parse_factory_start_limits(raw: Option<&str>) -> HashMap<String, i64> {
+    raw.unwrap_or("")
+        .split(',')
+        .filter_map(|part| {
+            let (factory_id, value) = part.split_once(':')?;
+            let n = value.parse::<i64>().ok()?.max(1);
+            (!factory_id.trim().is_empty()).then(|| (factory_id.trim().to_string(), n))
+        })
+        .collect()
+}
+
+fn start_limit_for_factory(
+    factory_id: &str,
+    default_starts_per_week: i64,
+    factory_start_limits: &HashMap<String, i64>,
+) -> i64 {
+    factory_start_limits
+        .get(factory_id)
+        .copied()
+        .unwrap_or(default_starts_per_week)
+        .max(1)
+}
+
+fn parse_factory_percent_limits(raw: Option<&str>) -> HashMap<String, f64> {
+    raw.unwrap_or("")
+        .split(',')
+        .filter_map(|part| {
+            let (factory_id, value) = part.split_once(':')?;
+            let n = value.parse::<f64>().ok()?;
+            n.is_finite()
+                .then(|| (factory_id.trim().to_string(), n.clamp(-95.0, 500.0)))
+        })
+        .filter(|(factory_id, _)| !factory_id.is_empty())
+        .collect()
+}
+
+fn parse_factory_day_limits(raw: Option<&str>) -> HashMap<String, i64> {
+    raw.unwrap_or("")
+        .split(',')
+        .filter_map(|part| {
+            let (factory_id, value) = part.split_once(':')?;
+            let n = value.parse::<i64>().ok()?.clamp(-365, 3650);
+            (!factory_id.trim().is_empty()).then(|| (factory_id.trim().to_string(), n))
+        })
+        .collect()
+}
+
+fn lead_time_pct_for_factory(
+    factory_id: &str,
+    default_pct: f64,
+    factory_lead_time_limits: &HashMap<String, f64>,
+) -> f64 {
+    factory_lead_time_limits
+        .get(factory_id)
+        .copied()
+        .unwrap_or(default_pct)
+        .clamp(-95.0, 500.0)
+}
+
+fn lead_time_days_for_factory(
+    factory_id: &str,
+    default_days: i64,
+    factory_lead_time_day_limits: &HashMap<String, i64>,
+) -> i64 {
+    factory_lead_time_day_limits
+        .get(factory_id)
+        .copied()
+        .unwrap_or(default_days)
+        .clamp(-365, 3650)
+}
+
+fn adjusted_cycle_time_days(base_days: i64, pct: f64, day_offset: i64) -> i64 {
+    (((base_days.max(1) as f64) * (1.0 + pct / 100.0)).round() as i64 + day_offset).max(1)
 }
 
 const MAX_SYNC_RECOMMENDATION_UNITS: usize = 500;
@@ -50,7 +147,9 @@ fn parse_serial_list(raw: &str) -> Vec<String> {
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(run_scenario).service(get_run);
+    cfg.service(run_scenario)
+        .service(list_scenario_runs)
+        .service(get_run);
 }
 
 #[derive(Serialize)]
@@ -216,6 +315,7 @@ pub(crate) async fn load_schedule_input(
 #[derive(Debug, Clone)]
 struct AsapFactory {
     id: String,
+    changeover_days: i64,
     weekly_bays: BTreeMap<NaiveDate, i64>,
 }
 
@@ -242,14 +342,25 @@ fn window_available(
     intervals: &[(NaiveDate, NaiveDate)],
     start: NaiveDate,
     end: NaiveDate,
+    changeover_days: i64,
 ) -> bool {
-    intervals.iter().all(|(s, e)| *e < start || *s > end)
+    let gap = changeover_days.max(0);
+    intervals.iter().all(|(s, e)| {
+        let blocked_start = *s - Duration::days(gap);
+        let blocked_end = *e + Duration::days(gap);
+        blocked_end < start || blocked_start > end
+    })
 }
 
 pub(crate) fn schedule_orders_linear_finish(
     factories: &[FactoryWithBayCounts],
     orders: &[ScenarioOrder],
     max_starts_per_week: Option<i64>,
+    factory_start_limits: &HashMap<String, i64>,
+    lead_time_pct: f64,
+    factory_lead_time_limits: &HashMap<String, f64>,
+    lead_time_days: i64,
+    factory_lead_time_day_limits: &HashMap<String, i64>,
 ) -> AppResult<Vec<ScheduledUnit>> {
     if orders.is_empty() {
         return Ok(Vec::new());
@@ -272,6 +383,7 @@ pub(crate) fn schedule_orders_linear_finish(
         }
         facs.push(AsapFactory {
             id: f.id.clone(),
+            changeover_days: f.changeover_days.max(0),
             weekly_bays,
         });
     }
@@ -282,62 +394,149 @@ pub(crate) fn schedule_orders_linear_finish(
     };
     let horizon_finish = latest_week.unwrap_or(start_date) + Duration::days(6);
     let overflow_end = horizon_finish
-        + Duration::days(orders.iter().map(|o| o.cycle_time_days.max(1)).sum::<i64>() + 365);
+        + Duration::days(
+            orders
+                .iter()
+                .map(|o| {
+                    facs.iter()
+                        .map(|f| {
+                            adjusted_cycle_time_days(
+                                o.cycle_time_days,
+                                lead_time_pct_for_factory(
+                                    &f.id,
+                                    lead_time_pct,
+                                    factory_lead_time_limits,
+                                ),
+                                lead_time_days_for_factory(
+                                    &f.id,
+                                    lead_time_days,
+                                    factory_lead_time_day_limits,
+                                ),
+                            )
+                        })
+                        .max()
+                        .unwrap_or_else(|| {
+                            adjusted_cycle_time_days(
+                                o.cycle_time_days,
+                                lead_time_pct,
+                                lead_time_days,
+                            )
+                        })
+                })
+                .sum::<i64>()
+                + 365,
+        );
     let capacity_weeks =
         ((latest_week.unwrap_or(start_date) - start_date).num_days() / 7 + 1).max(1);
     let starts_per_week = max_starts_per_week
         .filter(|n| *n > 0)
         .unwrap_or_else(|| ((orders.len() as i64 + capacity_weeks - 1) / capacity_weeks).max(1));
     let mut reservations: HashMap<(String, i64), Vec<(NaiveDate, NaiveDate)>> = HashMap::new();
-    let mut launches_by_week: HashMap<i64, i64> = HashMap::new();
+    let mut launches_by_factory_week: HashMap<(String, i64), i64> = HashMap::new();
     let mut out = Vec::with_capacity(orders.len());
 
     for (idx, o) in orders.iter().enumerate() {
-        let duration = o.cycle_time_days.max(1);
         let idx = idx as i64;
+        let max_duration = facs
+            .iter()
+            .map(|f| {
+                adjusted_cycle_time_days(
+                    o.cycle_time_days,
+                    lead_time_pct_for_factory(&f.id, lead_time_pct, factory_lead_time_limits),
+                    lead_time_days_for_factory(&f.id, lead_time_days, factory_lead_time_day_limits),
+                )
+            })
+            .max()
+            .unwrap_or_else(|| {
+                adjusted_cycle_time_days(o.cycle_time_days, lead_time_pct, lead_time_days)
+            });
 
-        // Use due_date if present, otherwise calculate from start_date
-        let (target_start, target_finish) = if let Some(due_date_str) = &o.due_date {
-            let due_date = NaiveDate::parse_from_str(due_date_str, "%Y-%m-%d").map_err(|_| {
-                AppError::BadRequest(format!(
-                    "invalid due_date {} for order {}",
-                    due_date_str, o.utid
-                ))
-            })?;
-            let start = due_date - Duration::days(duration - 1);
-            // Ensure start is not before horizon start
-            let start = start.max(start_date);
-            (start, due_date)
+        let anchored_due_date = if let Some(due_date_str) = &o.due_date {
+            Some(
+                NaiveDate::parse_from_str(due_date_str, "%Y-%m-%d").map_err(|_| {
+                    AppError::BadRequest(format!(
+                        "invalid due_date {} for order {}",
+                        due_date_str, o.utid
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let planned_start = if let Some(due_date) = anchored_due_date {
+            (due_date - Duration::days(max_duration - 1)).max(start_date)
         } else {
             let week_bucket = idx / starts_per_week;
             let slot_in_week = idx % starts_per_week;
             let day_in_week = (slot_in_week * 7) / starts_per_week;
-            let start = start_date + Duration::days(week_bucket * 7 + day_in_week);
-            let finish = start + Duration::days(duration - 1);
-            (start, finish)
+            start_date + Duration::days(week_bucket * 7 + day_in_week)
         };
+        let fallback_target_finish = anchored_due_date.unwrap_or_else(|| {
+            planned_start
+                + Duration::days(
+                    adjusted_cycle_time_days(o.cycle_time_days, lead_time_pct, lead_time_days) - 1,
+                )
+        });
 
-        let is_anchored = o.due_date.is_some();
-        let latest_start_with_capacity = horizon_finish - Duration::days(duration - 1);
-        let mut best: Option<(NaiveDate, NaiveDate, String, i64)> = None;
-        let mut s = target_start;
-        while s <= latest_start_with_capacity && best.is_none() {
+        let is_anchored = o.due_date.is_some() || o.anchor_factory_id.is_some();
+        let mut best: Option<(NaiveDate, NaiveDate, NaiveDate, String, i64)> = None;
+        let mut s = planned_start;
+        while s <= horizon_finish && best.is_none() {
+            let week_idx = ((s - start_date).num_days()).div_euclid(7);
             if !is_anchored {
-                let week_idx = ((s - start_date).num_days()).div_euclid(7);
-                if launches_by_week.get(&week_idx).copied().unwrap_or(0) >= starts_per_week {
+                let any_factory_has_launch_room = facs.iter().any(|f| {
+                    if o.anchor_factory_id
+                        .as_deref()
+                        .is_some_and(|fid| fid != f.id)
+                    {
+                        return false;
+                    }
+                    let key = (f.id.clone(), week_idx);
+                    let used = launches_by_factory_week.get(&key).copied().unwrap_or(0);
+                    used < start_limit_for_factory(&f.id, starts_per_week, factory_start_limits)
+                });
+                if !any_factory_has_launch_room {
                     s = start_date + Duration::days((week_idx + 1) * 7);
                     continue;
                 }
             }
 
-            let e = s + Duration::days(duration - 1);
             for f in &facs {
-                let cap = min_bays_in_window(f, s, e);
+                if o.anchor_factory_id
+                    .as_deref()
+                    .is_some_and(|fid| fid != f.id)
+                {
+                    continue;
+                }
+                let duration = adjusted_cycle_time_days(
+                    o.cycle_time_days,
+                    lead_time_pct_for_factory(&f.id, lead_time_pct, factory_lead_time_limits),
+                    lead_time_days_for_factory(&f.id, lead_time_days, factory_lead_time_day_limits),
+                );
+                let candidate_start = anchored_due_date
+                    .map(|due_date| (due_date - Duration::days(duration - 1)).max(s))
+                    .unwrap_or(s);
+                let e = candidate_start + Duration::days(duration - 1);
+                let target_finish = anchored_due_date.unwrap_or(e);
+                if candidate_start > horizon_finish {
+                    continue;
+                }
+                let candidate_week_idx = ((candidate_start - start_date).num_days()).div_euclid(7);
+                if !is_anchored {
+                    let key = (f.id.clone(), candidate_week_idx);
+                    let used = launches_by_factory_week.get(&key).copied().unwrap_or(0);
+                    if used >= start_limit_for_factory(&f.id, starts_per_week, factory_start_limits)
+                    {
+                        continue;
+                    }
+                }
+                let cap = min_bays_in_window(f, candidate_start, e);
                 for bay in 0..cap {
                     let key = (f.id.clone(), bay);
                     let intervals = reservations.entry(key.clone()).or_default();
-                    if window_available(intervals, s, e) {
-                        best = Some((s, e, f.id.clone(), bay));
+                    if window_available(intervals, candidate_start, e, f.changeover_days) {
+                        best = Some((candidate_start, e, target_finish, f.id.clone(), bay));
                         break;
                     }
                 }
@@ -348,14 +547,16 @@ pub(crate) fn schedule_orders_linear_finish(
             s += Duration::days(1);
         }
 
-        if let Some((s, e, fid, bay)) = best {
+        if let Some((s, e, target_finish, fid, bay)) = best {
             reservations
                 .entry((fid.clone(), bay))
                 .or_default()
                 .push((s, e));
             if !is_anchored {
                 let week_idx = ((s - start_date).num_days()).div_euclid(7);
-                *launches_by_week.entry(week_idx).or_insert(0) += 1;
+                *launches_by_factory_week
+                    .entry((fid.clone(), week_idx))
+                    .or_insert(0) += 1;
             }
             out.push(ScheduledUnit {
                 id: new_id(),
@@ -384,9 +585,9 @@ pub(crate) fn schedule_orders_linear_finish(
                 due_date: overflow_end.to_string(),
                 status: "unshippable".to_string(),
                 serial: Some(o.utid.clone()),
-                orig_due_date: Some(target_finish.to_string()),
+                orig_due_date: Some(fallback_target_finish.to_string()),
                 is_late: false,
-                is_anchored: o.due_date.is_some(),
+                is_anchored,
             });
         }
     }
@@ -398,6 +599,11 @@ async fn run_orders_scenario(
     scenario_id: &str,
     orders: Vec<ScenarioOrder>,
     max_starts_per_week: Option<i64>,
+    factory_start_limits: &HashMap<String, i64>,
+    lead_time_pct: f64,
+    factory_lead_time_limits: &HashMap<String, f64>,
+    lead_time_days: i64,
+    factory_lead_time_day_limits: &HashMap<String, i64>,
 ) -> AppResult<RunResponse> {
     let factory_rows = sqlx::query_as::<_, Factory>(
         "SELECT id, scenario_id, name, bays, changeover_days FROM factory WHERE scenario_id = $1 ORDER BY name",
@@ -409,7 +615,16 @@ async fn run_orders_scenario(
     for f in factory_rows {
         factories.push(crate::handlers::factories::factory_with_bays(pool, f).await?);
     }
-    let mut units = schedule_orders_linear_finish(&factories, &orders, max_starts_per_week)?;
+    let mut units = schedule_orders_linear_finish(
+        &factories,
+        &orders,
+        max_starts_per_week,
+        factory_start_limits,
+        lead_time_pct,
+        factory_lead_time_limits,
+        lead_time_days,
+        factory_lead_time_day_limits,
+    )?;
     let run_id = new_id();
     let run_at = now_iso();
     let shipped = units.iter().filter(|u| u.status == "shipped").count() as i64;
@@ -484,18 +699,26 @@ async fn run_scenario(
     }
 
     let orders = sqlx::query_as::<_, ScenarioOrder>(
-        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
+        "SELECT id, scenario_id, utid, build_type, customer, cycle_time_days, sort_order, due_date, anchor_factory_id FROM scenario_order WHERE scenario_id = $1 ORDER BY sort_order, utid",
     )
     .bind(&scenario_id)
     .fetch_all(pool.get_ref())
     .await?;
     if !orders.is_empty() {
+        let factory_start_limits = query.factory_start_limits();
+        let factory_lead_time_limits = query.factory_lead_time_limits();
+        let factory_lead_time_day_limits = query.factory_lead_time_day_limits();
         return Ok(HttpResponse::Ok().json(
             run_orders_scenario(
                 pool.get_ref(),
                 &scenario_id,
                 orders,
                 query.max_starts_per_week,
+                &factory_start_limits,
+                query.lead_time_pct.unwrap_or(0.0),
+                &factory_lead_time_limits,
+                query.lead_time_days.unwrap_or(0),
+                &factory_lead_time_day_limits,
             )
             .await?,
         ));
@@ -616,6 +839,21 @@ async fn run_scenario(
         quarter_misses,
         alternatives,
     }))
+}
+
+#[get("/api/scenarios/{id}/runs")]
+async fn list_scenario_runs(
+    pool: web::Data<Pool>,
+    path: web::Path<String>,
+) -> AppResult<HttpResponse> {
+    let scenario_id = path.into_inner();
+    let rows = sqlx::query_as::<_, ScheduleRun>(
+        "SELECT id, scenario_id, run_at, total_demand, shipped_on_time, shipped_late, unshippable FROM schedule_run WHERE scenario_id = $1 ORDER BY run_at DESC LIMIT 50",
+    )
+    .bind(&scenario_id)
+    .fetch_all(pool.get_ref())
+    .await?;
+    Ok(HttpResponse::Ok().json(rows))
 }
 
 #[get("/api/runs/{id}")]
@@ -867,35 +1105,39 @@ mod plan_tests {
     use super::*;
 
     fn factory() -> FactoryWithBayCounts {
+        factory_with_id("f1")
+    }
+
+    fn factory_with_id(id: &str) -> FactoryWithBayCounts {
         FactoryWithBayCounts {
-            id: "f1".into(),
+            id: id.into(),
             scenario_id: "s1".into(),
-            name: "F1".into(),
+            name: id.to_string(),
             bays: 0,
             changeover_days: 0,
             bay_counts: vec![],
             bay_weeks: vec![
                 BayWeekRow {
                     id: "w1".into(),
-                    factory_id: "f1".into(),
+                    factory_id: id.into(),
                     week_start: "2026-08-02".into(),
                     bays: 10,
                 },
                 BayWeekRow {
                     id: "w2".into(),
-                    factory_id: "f1".into(),
+                    factory_id: id.into(),
                     week_start: "2026-08-09".into(),
                     bays: 10,
                 },
                 BayWeekRow {
                     id: "w3".into(),
-                    factory_id: "f1".into(),
+                    factory_id: id.into(),
                     week_start: "2026-08-16".into(),
                     bays: 10,
                 },
                 BayWeekRow {
                     id: "w4".into(),
-                    factory_id: "f1".into(),
+                    factory_id: id.into(),
                     week_start: "2026-08-23".into(),
                     bays: 10,
                 },
@@ -913,13 +1155,24 @@ mod plan_tests {
             cycle_time_days: 1,
             sort_order: i as i64,
             due_date: None,
+            anchor_factory_id: None,
         }
     }
 
     #[test]
     fn plan_orders_start_linearly_across_capacity_horizon() {
         let orders = vec![order(1), order(2), order(3), order(4)];
-        let units = schedule_orders_linear_finish(&[factory()], &orders, None).unwrap();
+        let units = schedule_orders_linear_finish(
+            &[factory()],
+            &orders,
+            None,
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
         let starts: Vec<_> = units.iter().map(|u| u.required_start.as_str()).collect();
         let finishes: Vec<_> = units.iter().map(|u| u.due_date.as_str()).collect();
         assert_eq!(
@@ -932,7 +1185,17 @@ mod plan_tests {
     #[test]
     fn plan_orders_respect_explicit_weekly_start_cap() {
         let orders = vec![order(1), order(2), order(3), order(4)];
-        let units = schedule_orders_linear_finish(&[factory()], &orders, Some(2)).unwrap();
+        let units = schedule_orders_linear_finish(
+            &[factory()],
+            &orders,
+            Some(2),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
         let starts: Vec<_> = units.iter().map(|u| u.required_start.as_str()).collect();
         assert_eq!(
             starts,
@@ -941,9 +1204,129 @@ mod plan_tests {
     }
 
     #[test]
+    fn plan_orders_respect_factory_changeover_days() {
+        let mut f = factory();
+        f.changeover_days = 2;
+        for w in &mut f.bay_weeks {
+            w.bays = 1;
+        }
+        let mut orders = vec![order(1), order(2)];
+        for o in &mut orders {
+            o.cycle_time_days = 2;
+        }
+        let units = schedule_orders_linear_finish(
+            &[f],
+            &orders,
+            Some(10),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let starts: Vec<_> = units.iter().map(|u| u.required_start.as_str()).collect();
+        let finishes: Vec<_> = units.iter().map(|u| u.due_date.as_str()).collect();
+        assert_eq!(starts, vec!["2026-08-02", "2026-08-06"]);
+        assert_eq!(finishes, vec!["2026-08-03", "2026-08-07"]);
+    }
+
+    #[test]
+    fn plan_orders_apply_global_lead_time_percent() {
+        let mut o = order(1);
+        o.cycle_time_days = 10;
+        let units = schedule_orders_linear_finish(
+            &[factory()],
+            &[o],
+            Some(1),
+            &HashMap::new(),
+            50.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(units[0].required_start, "2026-08-02");
+        assert_eq!(units[0].due_date, "2026-08-16");
+    }
+
+    #[test]
+    fn plan_orders_apply_global_lead_time_days() {
+        let mut o = order(1);
+        o.cycle_time_days = 10;
+        let units = schedule_orders_linear_finish(
+            &[factory()],
+            &[o],
+            Some(1),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            -3,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(units[0].required_start, "2026-08-02");
+        assert_eq!(units[0].due_date, "2026-08-08");
+    }
+
+    #[test]
+    fn plan_orders_apply_factory_lead_time_percent_override() {
+        let mut anchored = order(1);
+        anchored.cycle_time_days = 2;
+        anchored.due_date = Some("2026-08-08".into());
+        anchored.anchor_factory_id = Some("f2".into());
+        let mut overrides = HashMap::new();
+        overrides.insert("f2".to_string(), 100.0);
+        let units = schedule_orders_linear_finish(
+            &[factory_with_id("f1"), factory_with_id("f2")],
+            &[anchored],
+            Some(1),
+            &HashMap::new(),
+            0.0,
+            &overrides,
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(units[0].factory_id.as_deref(), Some("f2"));
+        assert_eq!(units[0].required_start, "2026-08-05");
+        assert_eq!(units[0].due_date, "2026-08-08");
+    }
+
+    #[test]
+    fn anchored_factory_places_order_on_selected_factory() {
+        let mut anchored = order(1);
+        anchored.due_date = Some("2026-08-02".into());
+        anchored.anchor_factory_id = Some("f2".into());
+        let units = schedule_orders_linear_finish(
+            &[factory_with_id("f1"), factory_with_id("f2")],
+            &[anchored],
+            Some(1),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(units[0].factory_id.as_deref(), Some("f2"));
+        assert!(units[0].is_anchored);
+    }
+
+    #[test]
     fn one_weekly_start_cap_places_one_launch_per_week() {
         let orders: Vec<_> = (1..=4).map(order).collect();
-        let units = schedule_orders_linear_finish(&[factory()], &orders, Some(1)).unwrap();
+        let units = schedule_orders_linear_finish(
+            &[factory()],
+            &orders,
+            Some(1),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
         let starts: Vec<_> = units.iter().map(|u| u.required_start.as_str()).collect();
         assert_eq!(
             starts,
@@ -954,7 +1337,17 @@ mod plan_tests {
     #[test]
     fn one_weekly_start_cap_shortfalls_past_capacity_horizon() {
         let orders: Vec<_> = (1..=6).map(order).collect();
-        let units = schedule_orders_linear_finish(&[factory()], &orders, Some(1)).unwrap();
+        let units = schedule_orders_linear_finish(
+            &[factory()],
+            &orders,
+            Some(1),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
         let shipped_starts: Vec<_> = units
             .iter()
             .filter(|u| u.status == "shipped")
@@ -973,10 +1366,50 @@ mod plan_tests {
     #[test]
     fn plan_orders_change_when_weekly_start_cap_changes() {
         let orders: Vec<_> = (1..=10).map(order).collect();
-        let auto = schedule_orders_linear_finish(&[factory()], &orders, None).unwrap();
-        let one = schedule_orders_linear_finish(&[factory()], &orders, Some(1)).unwrap();
-        let two = schedule_orders_linear_finish(&[factory()], &orders, Some(2)).unwrap();
-        let ten = schedule_orders_linear_finish(&[factory()], &orders, Some(10)).unwrap();
+        let auto = schedule_orders_linear_finish(
+            &[factory()],
+            &orders,
+            None,
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let one = schedule_orders_linear_finish(
+            &[factory()],
+            &orders,
+            Some(1),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let two = schedule_orders_linear_finish(
+            &[factory()],
+            &orders,
+            Some(2),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let ten = schedule_orders_linear_finish(
+            &[factory()],
+            &orders,
+            Some(10),
+            &HashMap::new(),
+            0.0,
+            &HashMap::new(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
         let starts = |units: Vec<ScheduledUnit>| {
             units
                 .into_iter()
