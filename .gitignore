@@ -4,6 +4,8 @@ backend/target/
 *.db-journal
 *.db-shm
 *.db-wal
+*.dump
+supabase/.temp/
 
 # Python / generated analysis
 __pycache__/

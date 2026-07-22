@@ -1,206 +1,197 @@
-# Deployment plan: Render backend + Vercel frontend
+# Deployment plan: Render backend + Supabase Postgres + Vercel frontend
 
-This project is already committed and pushed to GitHub:
+## Target architecture
 
-- Repository: `https://github.com/prabaldangol25/factoryplan-rust`
-- Frontend framework: Vite + React in `frontend/`
-- Backend framework: Rust + Actix-web + SQLite in `backend/`
+- **Render** runs the Rust/Actix backend as a stateless web service.
+- **Supabase** hosts the PostgreSQL database.
+- **Vercel** serves the Vite/React frontend and continues to use the Render backend origin through `VITE_API_BASE_URL`.
 
-The recommended production setup is:
+The backend is already PostgreSQL-native. SQLx uses the Postgres driver, all application migrations are Postgres-compatible, and migrations run automatically when the backend starts. Moving to Supabase is therefore a database copy and `DATABASE_URL` cutover, not an application rewrite.
 
-- **Render** hosts the long-running Rust API server and its persistent SQLite database.
-- **Vercel** hosts the static Vite frontend and points it at the Render API URL.
+## Migration goals
 
-Vercel alone should not host the backend as-is because the backend is a persistent Actix web server using SQLite. It needs a long-running process and durable disk storage.
+1. Preserve all production application data.
+2. Keep the existing Render database unchanged during the acceptance period.
+3. Minimize the write freeze during final export and restore.
+4. Avoid placing database credentials in source control, shell history, URLs in documentation, or logs.
+5. Make rollback an environment-variable change while the old database is retained.
 
----
+## Phase 1: Prepare Supabase
 
-## Current state
+1. Create a Supabase project in the desired region.
+2. Generate and store its database password in an approved password manager.
+3. In Supabase database connection settings, copy these connection strings rather than constructing them manually:
+   - a **direct** connection string for migrations and `pg_restore` when the machine running them has compatible network access;
+   - a **session pooler** connection string for the long-running Render backend, especially when direct database networking is unavailable;
+   - do not use the transaction pooler for migration or restore operations.
+4. Ensure the selected URI requires TLS. Add `sslmode=require` only if the Supabase-provided URI does not already specify it.
+5. Do not commit either connection string. Store the temporary local values only in process environment variables.
 
-Already completed locally:
-
-1. GitHub repo created and pushed.
-2. Frontend has been updated to support `VITE_API_BASE_URL`.
-3. Frontend has been deployed once to Vercel.
-4. Generated local files and SQLite sidecar files are ignored by Git.
-
-Current Vercel URLs from the first deployment:
-
-- Production deployment: `https://frontend-3nnjck7eb-gops1.vercel.app`
-- Alias: `https://frontend-orcin-seven-85.vercel.app`
-
-These frontend URLs will load the UI, but API-backed features will not work until the backend is live and `VITE_API_BASE_URL` is configured in Vercel.
-
----
-
-## Step 1: Deploy the backend on Render
-
-In Render, create a new **Web Service** from the GitHub repository.
-
-### Render service settings
-
-Use these settings:
-
-| Setting | Value |
-|---|---|
-| Service type | `Web Service` |
-| Repository | `prabaldangol25/factoryplan-rust` |
-| Root Directory | `backend` |
-| Runtime | Rust / Native build from `Cargo.toml` |
-| Build Command | `cargo build --release` |
-| Start Command | `./target/release/factoryplan-backend` |
-| Instance type | Starter is fine for initial testing |
-
-### Render environment variables
-
-Set these environment variables on the Render backend service:
-
-| Variable | Value | Notes |
-|---|---|---|
-| `HOST` | `0.0.0.0` | Required so Render can route traffic to the service. |
-| `DATABASE_URL` | `sqlite:///var/data/factoryplan.db` | Stores SQLite on the persistent disk. |
-| `RUST_LOG` | `info` | Optional but useful for logs. |
-
-Do **not** manually set `PORT` unless Render specifically requires it. The app reads `PORT`, and Render provides it automatically for web services.
-
-### Render persistent disk
-
-Add a persistent disk to the Render service:
-
-| Disk setting | Value |
-|---|---|
-| Mount path | `/var/data` |
-| Size | Start with `1 GB`; increase if needed |
-
-The backend creates the SQLite file automatically if it does not exist. It also runs embedded SQL migrations on startup.
-
-### Backend health check
-
-After the Render deploy finishes, open:
-
-```text
-https://<your-render-service>.onrender.com/api/health
-```
-
-Expected response:
-
-```json
-{
-  "status": "ok",
-  "service": "factoryplan-backend",
-  "version": "0.1.0"
-}
-```
-
-Save the backend origin, without a trailing slash, for the Vercel step. Example:
-
-```text
-https://factoryplan-backend.onrender.com
-```
-
----
-
-## Step 2: Configure the Vercel frontend
-
-The Vercel frontend must know the backend origin. Set this environment variable in Vercel:
-
-| Variable | Value |
-|---|---|
-| `VITE_API_BASE_URL` | `https://<your-render-service>.onrender.com` |
-
-Use the Render service origin only. Do not include `/api` at the end.
-
-### Option A: Vercel dashboard
-
-1. Open the Vercel project.
-2. Go to **Settings → Environment Variables**.
-3. Add `VITE_API_BASE_URL`.
-4. Set it for **Production**.
-5. Redeploy the latest deployment or trigger a new production deploy.
-
-### Option B: Vercel CLI
-
-From the repo root:
+Suggested local variable names:
 
 ```powershell
-npx vercel env add VITE_API_BASE_URL production
+$env:RENDER_DATABASE_URL = "<Render external PostgreSQL URL>"
+$env:SUPABASE_DIRECT_URL = "<Supabase direct or session-pooler migration URL>"
 ```
 
-Paste the Render backend origin when prompted, for example:
+## Phase 2: Initialize and verify the destination schema
 
-```text
-https://factoryplan-backend.onrender.com
-```
-
-Then redeploy production:
+The destination should start without factoryplan application tables. Point the local backend at Supabase once so the embedded SQLx migrations create the schema and `_sqlx_migrations` history:
 
 ```powershell
-npx vercel frontend --prod
+cd backend
+$env:HOST = "127.0.0.1"
+$env:PORT = "8080"
+$env:DATABASE_URL = $env:SUPABASE_DIRECT_URL
+$env:DB_POOL_MAX_CONNECTIONS = "3"
+$env:DB_POOL_MIN_CONNECTIONS = "1"
+cargo run
 ```
 
----
+Confirm `/api/health`, then stop this local backend before restoring data. Inspect Supabase and verify migrations `0001` through `0014` are recorded. Do not create scenarios or other application data in Supabase yet.
 
-## Step 3: Verify the full app
+## Phase 3: Rehearse the production copy
 
-After the frontend redeploys, open the production Vercel URL and verify:
+Before the final cutover, perform a rehearsal while the production backend remains online:
 
-1. The UI loads.
-2. The Scenarios tab loads without API errors.
-3. Creating a scenario works.
-4. Adding a factory/product/demand row works.
-5. Running the scheduler works.
-6. Exporting CSV/XLSX works.
+1. Create a custom-format, data-only dump from the Render PostgreSQL database.
+2. Exclude `_sqlx_migrations`; Supabase already has migration history from Phase 2.
+3. Restore into a disposable Supabase project or reset destination.
+4. Compare row counts for every application table.
+5. Run the backend locally against the restored database and exercise the application.
+6. Delete the rehearsal destination only after recording the results. Never delete or alter the source database.
 
-Also verify the backend directly:
+Use PostgreSQL client tools compatible with the source server version:
+
+```powershell
+$dump = Join-Path $PWD "factoryplan-production-data.dump"
+pg_dump --format=custom --data-only --schema=public --exclude-table=public._sqlx_migrations --no-owner --no-privileges --file=$dump $env:RENDER_DATABASE_URL
+pg_restore --data-only --no-owner --no-privileges --dbname=$env:SUPABASE_DIRECT_URL $dump
+```
+
+The dump contains production data and must not be committed. Delete it securely after the migration and retention window according to the applicable data-handling policy.
+
+## Phase 4: Final cutover
+
+### 4.1 Freeze writes
+
+Stop or suspend the Render backend immediately before the final dump. The frontend may remain deployed, but API actions will be temporarily unavailable. Verify no process can write to the source database during the copy.
+
+### 4.2 Create the final dump
+
+Run the same `pg_dump` command used in rehearsal. Record:
+
+- dump completion time;
+- dump file size;
+- source row counts;
+- source database identifier.
+
+### 4.3 Restore to Supabase
+
+Restore the final dump into the already migrated, otherwise empty Supabase schema. If rehearsal data exists in the destination, reset only the factoryplan application tables before the final restore. Any reset/drop operation requires explicit confirmation and a verified backup.
+
+### 4.4 Validate data before traffic
+
+Compare source and destination counts for these tables:
 
 ```text
-https://<your-render-service>.onrender.com/api/health
+scenario
+factory
+factory_bay_count
+factory_bay_week
+product
+product_lead_time
+product_factory_lead_time
+product_factory_allocation
+demand
+scenario_order
+schedule_run
+scheduled_unit
+recommendation
+quarter_miss
+agent_conversation
+agent_message
 ```
 
----
+Also verify:
 
-## Important notes
+- all foreign keys are valid;
+- all 14 SQLx migrations are present;
+- a representative scenario contains its factories, orders, weekly capacity, runs, and anchored units;
+- no application table contains duplicate primary keys.
 
-### Agent tab
+### 4.5 Switch Render
 
-The Agent tab depends on the `devin` CLI being installed and authenticated on the backend host. A standard Render Rust service will not have an authenticated `devin` CLI by default.
+Set these variables on the existing Render backend service:
 
-The rest of the app works without it. If the Agent tab is required in production, handle that as a separate deployment task and avoid placing credentials in Git.
+```text
+HOST=0.0.0.0
+DATABASE_URL=<Supabase session-pooler connection string with TLS required>
+DB_POOL_MAX_CONNECTIONS=3
+DB_POOL_MIN_CONNECTIONS=1
+RUST_LOG=info
+APP_PASSWORD=<existing shared password>
+```
 
-### SQLite persistence
+`3` is a conservative initial application-pool size, not a universal Supabase limit. Confirm the current project connection allowance in Supabase and tune this value without code changes.
 
-SQLite is acceptable for this small planning app if the Render service runs as a single instance with a persistent disk. Do not scale the backend horizontally with multiple instances while using one SQLite database file.
+Redeploy/restart Render. A backend restart invalidates existing application login sessions, so users must log in again with the same `APP_PASSWORD`.
 
-For a larger multi-user production app, migrate from SQLite to Postgres.
+Vercel does not require a database-related change. Keep:
 
-### Existing local data
+```text
+VITE_API_BASE_URL=<existing Render backend origin>
+```
 
-The GitHub repo intentionally does not include the local SQLite database. The first hosted deploy will start with an empty database.
+## Phase 5: Production smoke test
 
-If existing local scenarios must be moved to production, stop the local backend first so SQLite flushes cleanly, then copy these files into the Render persistent disk using an approved Render data import method:
+Verify in this order:
 
-- `backend/factoryplan.db`
-- `backend/factoryplan.db-wal`, if present
-- `backend/factoryplan.db-shm`, if present
+1. Render backend starts without migration or TLS errors.
+2. `/api/health` returns `status: ok`.
+3. Login succeeds with the existing shared password.
+4. Existing scenarios and production row counts are present.
+5. Open a representative scenario and inspect factories, weekly bays, orders, anchors, and run history.
+6. Create a temporary validation scenario.
+7. Run the scheduler and inspect Results and Report.
+8. Export CSV/XLSX.
+9. Delete only the temporary validation scenario after explicit confirmation.
+10. Monitor Render and Supabase connection/error metrics through the acceptance period.
 
-Only do this if you intentionally want the hosted app to contain the local data.
+## Rollback
 
-### CORS
+Retain the old Render database unchanged until acceptance is complete.
 
-The backend currently allows cross-origin requests, so the Vercel frontend can call the Render backend directly.
+If cutover fails before new production writes are accepted:
 
----
+1. stop the backend to freeze writes;
+2. restore Render's previous `DATABASE_URL` value;
+3. restore its previous pool settings if changed;
+4. redeploy/restart Render;
+5. verify health and representative source data.
 
-## Deployment order checklist
+If users have written data to Supabase after cutover, switching back alone loses those new writes from the active view. Freeze writes and explicitly reconcile/export the Supabase changes before rollback.
 
-- [ ] Create Render Web Service from `prabaldangol25/factoryplan-rust`.
-- [ ] Set Render root directory to `backend`.
-- [ ] Set Render build command: `cargo build --release`.
-- [ ] Set Render start command: `./target/release/factoryplan-backend`.
-- [ ] Add Render persistent disk at `/var/data`.
-- [ ] Set Render env vars: `HOST=0.0.0.0`, `DATABASE_URL=sqlite:///var/data/factoryplan.db`, `RUST_LOG=info`.
-- [ ] Deploy Render backend.
-- [ ] Confirm `/api/health` returns `status: ok`.
-- [ ] Set Vercel env var `VITE_API_BASE_URL` to the Render backend origin.
-- [ ] Redeploy Vercel frontend production.
-- [ ] Verify app features end-to-end.
+Do not delete the source Render database, its backups, or the final dump until the acceptance and rollback window has passed.
+
+## Render cost change
+
+Supabase removes the database workload from Render. The Render backend can run without a database persistent disk because all durable application state lives in Supabase. Whether the Render web service itself can use a free plan depends on Render's current service-plan rules and acceptable cold-start behavior; this database migration does not eliminate the need to host the Rust web process.
+
+## Release gates
+
+Do not cut over production until all gates pass:
+
+- [ ] Supabase project and connection strings created.
+- [ ] Destination migrations `0001`–`0014` applied.
+- [ ] Rehearsal dump/restore completed.
+- [ ] Rehearsal row counts match.
+- [ ] Local backend smoke test against restored Supabase data passes.
+- [ ] Final source write freeze confirmed.
+- [ ] Final dump completed and retained securely.
+- [ ] Final restore completed.
+- [ ] Final source/destination row counts match.
+- [ ] Render environment values recorded for rollback.
+- [ ] Render cutover succeeds.
+- [ ] Full production smoke test passes.
+- [ ] Monitoring shows no database connection errors.

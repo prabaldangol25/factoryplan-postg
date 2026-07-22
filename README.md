@@ -169,6 +169,8 @@ The backend reads these environment variables:
 | `DEVIN_CMD` | `devin` | Path to the `devin` CLI used by the Agent tab. Override if not on PATH. |
 | `APP_PASSWORD` | unset | Optional shared password that enables the login gate. |
 | `APP_SESSION_TTL_HOURS` | `12` | Lifetime of the opaque in-memory login session. Backend restarts invalidate active sessions. |
+| `DB_POOL_MAX_CONNECTIONS` | `8` | Maximum PostgreSQL connections. Use a lower value when required by a hosted database plan. |
+| `DB_POOL_MIN_CONNECTIONS` | `1` | Minimum PostgreSQL connections, capped at the configured maximum. |
 
 The Agent tab requires the [`devin` CLI](https://cli.devin.ai/docs) installed,
 authenticated (`devin auth login`), and on PATH. The backend spawns it
