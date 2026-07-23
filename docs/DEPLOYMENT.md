@@ -131,6 +131,7 @@ DB_POOL_MAX_CONNECTIONS=3
 DB_POOL_MIN_CONNECTIONS=1
 RUST_LOG=info
 APP_PASSWORD=<existing shared password>
+ALLOWED_ORIGINS=<Vercel frontend origin, for example https://your-app.vercel.app>
 ```
 
 `3` is a conservative initial application-pool size, not a universal Supabase limit. Confirm the current project connection allowance in Supabase and tune this value without code changes.
@@ -176,7 +177,9 @@ Do not delete the source Render database, its backups, or the final dump until t
 
 ## Render cost change
 
-Supabase removes the database workload from Render. The Render backend can run without a database persistent disk because all durable application state lives in Supabase. Whether the Render web service itself can use a free plan depends on Render's current service-plan rules and acceptable cold-start behavior; this database migration does not eliminate the need to host the Rust web process.
+Supabase removes the database workload from Render. The Render backend can run without a database persistent disk because all durable application state lives in Supabase. The Render PostgreSQL instance is no longer required after production has been verified against Supabase and the rollback window has passed. Do not delete or allow deletion of the old Render PostgreSQL instance until the Supabase row counts, smoke tests, and retention/backup requirements are complete.
+
+The database migration does not eliminate the need to host the Rust web process. If Render's current free web-service tier is acceptable for the app's availability and cold-start requirements, the backend can be hosted as a stateless web service while the database lives in Supabase. If cold starts, uptime, or resource limits are not acceptable, use a paid Render web-service plan or another backend host.
 
 ## Release gates
 

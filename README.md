@@ -167,9 +167,10 @@ The backend reads these environment variables:
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/factoryplan` | PostgreSQL connection URL |
 | `RUST_LOG` | `info` | Standard `env_logger` filter |
 | `DEVIN_CMD` | `devin` | Path to the `devin` CLI used by the Agent tab. Override if not on PATH. |
-| `APP_PASSWORD` | unset | Optional shared password that enables the login gate. |
+| `APP_PASSWORD` | unset | Optional shared password that enables the login gate. Required when `HOST` is non-local, such as `0.0.0.0` on Render. |
 | `APP_SESSION_TTL_HOURS` | `12` | Lifetime of the opaque in-memory login session. Backend restarts invalidate active sessions. |
-| `DB_POOL_MAX_CONNECTIONS` | `8` | Maximum PostgreSQL connections. Use a lower value when required by a hosted database plan. |
+| `ALLOWED_ORIGINS` | unset | Optional comma-separated browser origins for CORS, such as the Vercel frontend URL. If unset, all origins are allowed. |
+| `DB_POOL_MAX_CONNECTIONS` | `3` | Maximum PostgreSQL connections. Keep low for hosted databases such as Supabase unless the plan supports more. |
 | `DB_POOL_MIN_CONNECTIONS` | `1` | Minimum PostgreSQL connections, capped at the configured maximum. |
 
 The Agent tab requires the [`devin` CLI](https://cli.devin.ai/docs) installed,
