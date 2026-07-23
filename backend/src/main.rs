@@ -60,6 +60,32 @@ fn configured_password() -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn cors_config() -> Cors {
+    let cors = Cors::default()
+        .allow_any_method()
+        .allow_any_header()
+        .max_age(3600);
+    let origins = std::env::var("ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if origins.is_empty() {
+        return cors.allow_any_origin();
+    }
+
+    origins
+        .iter()
+        .fold(cors, |cors, origin| cors.allowed_origin(origin))
+}
+
 static SESSIONS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn session_ttl() -> Duration {
@@ -185,6 +211,10 @@ async fn main() -> std::io::Result<()> {
         "postgresql://postgres:postgres@localhost:5432/factoryplan".to_string()
     });
 
+    if !is_local_host(&host) && configured_password().is_none() {
+        panic!("APP_PASSWORD must be set when binding to a non-local host");
+    }
+
     log::info!("factoryplan-backend starting on {host}:{port}");
 
     let pool: Pool = db::init_pool(&database_url)
@@ -195,11 +225,7 @@ async fn main() -> std::io::Result<()> {
     handlers::agent::cleanup_temp_files();
 
     HttpServer::new(move || {
-        let cors = Cors::default()
-            .allow_any_origin()
-            .allow_any_method()
-            .allow_any_header()
-            .max_age(3600);
+        let cors = cors_config();
 
         App::new()
             .app_data(web::Data::new(pool.clone()))

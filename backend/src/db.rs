@@ -12,7 +12,7 @@ fn pool_size(name: &str, default: u32) -> u32 {
 }
 
 pub async fn init_pool(database_url: &str) -> Result<Pool, sqlx::Error> {
-    let max_connections = pool_size("DB_POOL_MAX_CONNECTIONS", 8);
+    let max_connections = pool_size("DB_POOL_MAX_CONNECTIONS", 3);
     let min_connections = pool_size("DB_POOL_MIN_CONNECTIONS", 1).min(max_connections);
     log::info!(
         "database pool configured with {min_connections} minimum and {max_connections} maximum connections"
